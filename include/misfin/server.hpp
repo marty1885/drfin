@@ -15,7 +15,11 @@ struct IncomingMessage
 {
     Request request;
     trantor::CertificatePtr sender;
+    std::string serverName;
 };
+
+using ServerIdentityProvider =
+    std::function<std::shared_ptr<const Credentials>(const std::string &serverName)>;
 
 using TofuDecision = std::function<void(bool accept)>;
 using DeliveryDecision = std::function<void(bool accept)>;
@@ -36,6 +40,13 @@ class Server
     // Starts one reuse-port TLS listener on each Drogon IO loop. Must be called
     // before drogon::app().run().
     void listen(Credentials identity,
+                TofuHandler tofuHandler,
+                DeliveryHandler deliveryHandler,
+                std::string address = "0.0.0.0",
+                unsigned short port = kMisfinPort);
+    // The provider runs synchronously during the TLS handshake and may be
+    // called concurrently. Return nullptr to reject the handshake.
+    void listen(ServerIdentityProvider identityProvider,
                 TofuHandler tofuHandler,
                 DeliveryHandler deliveryHandler,
                 std::string address = "0.0.0.0",

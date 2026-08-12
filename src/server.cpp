@@ -23,23 +23,35 @@ namespace drfin
 {
 namespace
 {
-std::string certificateFingerprint(const std::string &pem)
+std::string certificateFingerprint(const trantor::CertificatePtr &certificate)
 {
-    if (pem.empty())
-    {
-        LOG_ERROR << "Misfin server certificate PEM is empty";
-        return {};
-    }
-    const auto certificate = trantor::Certificate::fromPem(pem);
     if (!certificate)
     {
-        LOG_ERROR << "Misfin server certificate PEM is invalid";
+        LOG_ERROR << "Misfin server has no local TLS certificate";
         return {};
     }
     const auto fingerprint = normalizeFingerprint(certificate->sha256Fingerprint());
     if (fingerprint.empty())
         LOG_ERROR << "Misfin server certificate has no SHA-256 fingerprint";
     return fingerprint;
+}
+
+void validateIdentity(const Credentials &identity)
+{
+    if (!trantor::Certificate::fromPem(identity.certificatePem))
+        throw std::invalid_argument("Misfin server requires a valid certificate PEM");
+    const auto &keyPem = identity.privateKeyPem.empty()
+                             ? identity.certificatePem
+                             : identity.privateKeyPem;
+    if (keyPem.find("PRIVATE KEY-----") == std::string::npos)
+        throw std::invalid_argument("Misfin server requires a private key PEM");
+}
+
+std::string certificateBundle(const Credentials &identity)
+{
+    if (identity.privateKeyPem.empty() || identity.privateKeyPem == identity.certificatePem)
+        return identity.certificatePem;
+    return identity.certificatePem + identity.privateKeyPem;
 }
 
 std::optional<Request> parseRequest(const std::string &line)
@@ -59,6 +71,8 @@ std::optional<Request> parseRequest(const std::string &line)
 struct ConnectionState
 {
     std::weak_ptr<trantor::TcpConnection> connection;
+    std::string fingerprint;
+    std::string serverName;
     bool replied = false;
 };
 
@@ -106,15 +120,16 @@ class Listener : public std::enable_shared_from_this<Listener>
 {
   public:
     Listener(trantor::EventLoop &loop,
-             std::string fingerprint,
              TofuHandler tofuHandler,
              DeliveryHandler deliveryHandler)
-        : loop_(loop), fingerprint_(std::move(fingerprint)),
-          tofuHandler_(std::move(tofuHandler)), deliveryHandler_(std::move(deliveryHandler))
+        : loop_(loop), tofuHandler_(std::move(tofuHandler)),
+          deliveryHandler_(std::move(deliveryHandler))
     {
     }
 
-    void listen(Credentials identity, std::string address, unsigned short port)
+    void listen(ServerIdentityProvider identityProvider,
+                std::string address,
+                unsigned short port)
     {
         server_ = std::make_unique<trantor::TcpServer>(
             &loop_, trantor::InetAddress(address, port), "misfin-server", true, true);
@@ -122,8 +137,12 @@ class Listener : public std::enable_shared_from_this<Listener>
         // Request, but do not TLS-validate, sender certificates. Misfin's
         // asynchronous TOFU handler decides trust after the handshake.
         auto policy = trantor::TLSPolicy::defaultServerPolicy("", "");
-        policy->setCertificatePem(identity.certificatePem, identity.privateKeyPem)
-            .setPeerCertificateRequest(false)
+        policy->setServerCertificateCallback([identityProvider = std::move(identityProvider)](
+                                                  const std::string &serverName) {
+            const auto identity = identityProvider(serverName);
+            return identity ? certificateBundle(*identity) : std::string{};
+        });
+        policy->setPeerCertificateRequest(false)
             .setCertificateVerification(false);
         server_->enableSSL(std::move(policy));
         const std::weak_ptr<Listener> weak = shared_from_this();
@@ -187,6 +206,10 @@ class Listener : public std::enable_shared_from_this<Listener>
         const auto peer = connection->peerCertificate();
         if (!peer)
             return reply(state, 60, "certificate required");
+        state->fingerprint = certificateFingerprint(connection->localCertificate());
+        if (state->fingerprint.empty())
+            return reply(state, 50, "internal server error");
+        state->serverName = connection->sniName();
 
         const auto deliveryPeer = peer;
         const auto tofuDecision = std::make_shared<std::atomic_bool>(false);
@@ -204,7 +227,7 @@ class Listener : public std::enable_shared_from_this<Listener>
                     return reply(state, 63, "certificate declined");
                 const auto deliveryDecision = std::make_shared<std::atomic_bool>(false);
                 self->deliveryHandler_(
-                    {std::move(request), std::move(peer)},
+                    {std::move(request), std::move(peer), state->serverName},
                     [weak, deliveryDecision, state](bool delivered) {
                         const auto self = weak.lock();
                         if (!self || !claimDecision(deliveryDecision))
@@ -214,7 +237,7 @@ class Listener : public std::enable_shared_from_this<Listener>
                             if (!self)
                                 return;
                             if (delivered)
-                                reply(state, 20, self->fingerprint_);
+                                reply(state, 20, state->fingerprint);
                             else
                                 reply(state, 51, "mailbox does not exist");
                         });
@@ -225,7 +248,6 @@ class Listener : public std::enable_shared_from_this<Listener>
 
     trantor::EventLoop &loop_;
     std::unique_ptr<trantor::TcpServer> server_;
-    std::string fingerprint_;
     TofuHandler tofuHandler_;
     DeliveryHandler deliveryHandler_;
 };
@@ -239,18 +261,29 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
                 std::string address,
                 unsigned short port)
     {
-        const auto fingerprint = certificateFingerprint(identity.certificatePem);
-        if (fingerprint.empty())
-            throw std::invalid_argument("Misfin server requires a valid certificate PEM");
+        validateIdentity(identity);
+        auto sharedIdentity = std::make_shared<const Credentials>(std::move(identity));
+        listen([sharedIdentity](const std::string &) { return sharedIdentity; },
+               std::move(tofuHandler), std::move(deliveryHandler),
+               std::move(address), port);
+    }
+
+    void listen(ServerIdentityProvider identityProvider,
+                TofuHandler tofuHandler,
+                DeliveryHandler deliveryHandler,
+                std::string address,
+                unsigned short port)
+    {
+        if (!identityProvider)
+            throw std::invalid_argument("Misfin server requires an identity provider");
         if (started_)
             throw std::logic_error("Misfin server is already listening");
         started_ = true;
         const std::weak_ptr<Impl> weak = shared_from_this();
         drogon::app().registerBeginningAdvice(
             [weak,
-             identity = std::move(identity),
-             fingerprint,
-             tofuHandler = std::move(tofuHandler),
+              identityProvider = std::move(identityProvider),
+              tofuHandler = std::move(tofuHandler),
              deliveryHandler = std::move(deliveryHandler),
              address = std::move(address),
              port] {
@@ -262,8 +295,7 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
                     auto *loop = drogon::app().getIOLoop(i);
                     loop->queueInLoop([weak,
                                        loop,
-                                       identity,
-                                       fingerprint,
+                                        identityProvider,
                                        tofuHandler,
                                        deliveryHandler,
                                        address,
@@ -272,8 +304,8 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
                         if (!self || self->stopped_.load(std::memory_order_relaxed))
                             return;
                         auto listener = std::make_shared<Listener>(
-                            *loop, fingerprint, tofuHandler, deliveryHandler);
-                        listener->listen(identity, address, port);
+                            *loop, tofuHandler, deliveryHandler);
+                        listener->listen(identityProvider, address, port);
                         std::lock_guard<std::mutex> lock{self->mutex_};
                         self->listeners_.push_back(std::move(listener));
                     });
@@ -311,6 +343,17 @@ void Server::listen(Credentials identity,
 {
     impl_->listen(std::move(identity), std::move(tofuHandler), std::move(deliveryHandler),
                     std::move(address), port);
+}
+
+void Server::listen(ServerIdentityProvider identityProvider,
+                    TofuHandler tofuHandler,
+                    DeliveryHandler deliveryHandler,
+                    std::string address,
+                    unsigned short port)
+{
+    impl_->listen(std::move(identityProvider),
+                  std::move(tofuHandler), std::move(deliveryHandler),
+                  std::move(address), port);
 }
 
 void Server::stop()

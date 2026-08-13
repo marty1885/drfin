@@ -36,14 +36,18 @@ int main(int argc, char **argv)
         drfin::Server server;
         server.listen(
             {readFile(argv[1]), readFile(argv[2])},
-            [](trantor::CertificatePtr peer, drfin::TofuDecision decide) {
-                std::cout << "TOFU " << peer->sha256Fingerprint() << "\n";
+            [](drfin::TrustRequest request, drfin::TofuDecision decide) {
+                std::cout << "TOFU " << request.sender->sha256Fingerprint()
+                          << " for " << request.recipient << "\n";
                 decide(true);
             },
             [](drfin::IncomingMessage message, drfin::DeliveryDecision decide) {
                 std::cout << "from " << message.sender->sha256Fingerprint() << " to "
                           << message.request.recipient << ": " << message.request.message << "\n";
-                decide(message.request.recipient == "queen@127.0.0.1");
+                if (message.request.recipient == "queen@127.0.0.1")
+                    decide(20, {});
+                else
+                    decide(51, "mailbox does not exist");
             },
             "127.0.0.1");
         drogon::app().setThreadNum(threadCount);

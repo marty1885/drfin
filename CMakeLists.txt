@@ -19,6 +19,10 @@ if(BUILD_TESTING)
     add_executable(gemmail-test tests/gemmail_test.cpp)
     target_link_libraries(gemmail-test PRIVATE misfin)
     add_test(NAME gemmail COMMAND gemmail-test)
+
+    add_executable(misfin-server-api-test tests/server_api_test.cpp)
+    target_link_libraries(misfin-server-api-test PRIVATE misfin)
+    add_test(NAME misfin-server-api COMMAND misfin-server-api-test)
 endif()
 
 if(DRFIN_BUILD_EXAMPLES)

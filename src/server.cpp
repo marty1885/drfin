@@ -112,6 +112,10 @@ void reply(const std::shared_ptr<ConnectionState> &state,
     {
         connection->send(response);
         connection->clearContext();
+        // Misfin is exactly one request and one response per TLS connection.
+        // shutdown() flushes the queued response, then sends close_notify and
+        // closes the write side; clients must not wait indefinitely for EOF.
+        connection->shutdown();
     }
 }
 }  // namespace
@@ -137,11 +141,14 @@ class Listener : public std::enable_shared_from_this<Listener>
         // Request, but do not TLS-validate, sender certificates. Misfin's
         // asynchronous TOFU handler decides trust after the handshake.
         auto policy = trantor::TLSPolicy::defaultServerPolicy("", "");
-        policy->setServerCertificateCallback([identityProvider = std::move(identityProvider)](
-                                                  const std::string &serverName) {
-            const auto identity = identityProvider(serverName);
-            return identity ? certificateBundle(*identity) : std::string{};
-        });
+        policy->setServerCertificateProvider(
+            [identityProvider = std::move(identityProvider)](
+                std::string serverName, trantor::ServerCertificateReply reply) {
+                identityProvider(std::move(serverName),
+                                 [reply = std::move(reply)](std::shared_ptr<const Credentials> identity) mutable {
+                    reply(identity ? certificateBundle(*identity) : std::string{});
+                });
+            });
         policy->setPeerCertificateRequest(false)
             .setCertificateVerification(false);
         server_->enableSSL(std::move(policy));
@@ -165,7 +172,7 @@ class Listener : public std::enable_shared_from_this<Listener>
             return;
         }
         const std::weak_ptr<Listener> weak = shared_from_this();
-        loop_.queueInLoop([weak] {
+        loop_.runInLoop([weak] {
             if (const auto self = weak.lock())
                 self->stopInLoop();
         });
@@ -214,12 +221,18 @@ class Listener : public std::enable_shared_from_this<Listener>
         const auto deliveryPeer = peer;
         const auto tofuDecision = std::make_shared<std::atomic_bool>(false);
         const std::weak_ptr<Listener> weak = shared_from_this();
-        tofuHandler_(peer, [weak, tofuDecision, state, request = *request, peer = std::move(deliveryPeer)](
-                               bool accepted) mutable {
+        tofuHandler_(
+            {peer, request->recipient, state->serverName},
+            [weak, tofuDecision, state, request = *request, peer = std::move(deliveryPeer)](
+                bool accepted) mutable {
             const auto self = weak.lock();
             if (!self || !claimDecision(tofuDecision))
                 return;
-            self->loop_.queueInLoop([weak, state, request = std::move(request), peer = std::move(peer), accepted] {
+            self->loop_.runInLoop([weak,
+                                     state,
+                                     request = std::move(request),
+                                     peer = std::move(peer),
+                                     accepted] {
                 const auto self = weak.lock();
                 if (!self)
                     return;
@@ -228,18 +241,21 @@ class Listener : public std::enable_shared_from_this<Listener>
                 const auto deliveryDecision = std::make_shared<std::atomic_bool>(false);
                 self->deliveryHandler_(
                     {std::move(request), std::move(peer), state->serverName},
-                    [weak, deliveryDecision, state](bool delivered) {
+                    [weak, deliveryDecision, state](int status, std::string meta) {
                         const auto self = weak.lock();
                         if (!self || !claimDecision(deliveryDecision))
                             return;
-                        self->loop_.queueInLoop([weak, state, delivered] {
+                        self->loop_.runInLoop([weak,
+                                              state,
+                                              status,
+                                              meta = std::move(meta)] {
                             const auto self = weak.lock();
                             if (!self)
                                 return;
-                            if (delivered)
-                                reply(state, 20, state->fingerprint);
+                            if (status / 10 == 2)
+                                reply(state, status, state->fingerprint);
                             else
-                                reply(state, 51, "mailbox does not exist");
+                                reply(state, status, meta);
                         });
                     });
             });
@@ -263,7 +279,7 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
     {
         validateIdentity(identity);
         auto sharedIdentity = std::make_shared<const Credentials>(std::move(identity));
-        listen([sharedIdentity](const std::string &) { return sharedIdentity; },
+        listen([sharedIdentity](std::string, ServerIdentityReply reply) { reply(sharedIdentity); },
                std::move(tofuHandler), std::move(deliveryHandler),
                std::move(address), port);
     }
@@ -293,7 +309,7 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
                 for (size_t i = 0; i < drogon::app().getThreadNum(); ++i)
                 {
                     auto *loop = drogon::app().getIOLoop(i);
-                    loop->queueInLoop([weak,
+                    loop->runInLoop([weak,
                                        loop,
                                         identityProvider,
                                        tofuHandler,

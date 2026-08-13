@@ -182,7 +182,7 @@ class Operation : public std::enable_shared_from_this<Operation>
                                      LOG_ERROR << "Misfin server trust callback invoked more than once";
                                      return;
                                  }
-                                 self->loop_.queueInLoop([weak, weakConnection, accepted] {
+                                 self->loop_.runInLoop([weak, weakConnection, accepted] {
                                      const auto self = weak.lock();
                                      if (!self)
                                          return;
@@ -235,7 +235,7 @@ class Operation : public std::enable_shared_from_this<Operation>
         finished_ = true;
         loop_.invalidateTimer(timeout_);
         auto self = shared_from_this();
-        loop_.queueInLoop([self, result = std::move(result)]() mutable {
+        loop_.runInLoop([self, result = std::move(result)]() mutable {
             self->client_.reset();
             self->resolver_.reset();
             if (self->callback_)
@@ -279,7 +279,7 @@ void sendMail(Request request,
                                                   std::move(credentials),
                                                   std::move(callback),
                                                   std::move(trust));
-    loop->queueInLoop([operation] { operation->start(); });
+    loop->runInLoop([operation] { operation->start(); });
 }
 
 drogon::Task<Result> sendMailCoro(Request request,

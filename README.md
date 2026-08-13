@@ -13,23 +13,33 @@ server.listen(
     {readFile(argv[1]), readFile(argv[2])},
 
     // TOFU verification callback. Call `decide(false)` to reject
-    [](const trantor::CertificatePtr &peer, drfin::TofuDecision decide) {
-        std::cout << "TOFU " << peer.fingerprint << "\n";
+    [](drfin::TrustRequest trust, drfin::TofuDecision decide) {
+        std::cout << "TOFU " << trust.sender->sha256Fingerprint()
+                  << " for " << trust.recipient << "\n";
         decide(true);
     },
 
-    // Delivery callback, check and deliver the mail. `decide(false)` indicates failure.
+    // Delivery callback: return a Misfin status and meta after policy/storage.
     [](const drfin::IncomingMessage &message, drfin::DeliveryDecision decide) {
-        std::cout << "from " << message.sender.fingerprint << " to "
+        std::cout << "from " << message.sender->sha256Fingerprint() << " to "
                     << message.request.recipient << ": " << message.request.message << "\n";
 
         // The recipient lacks the misfin:// prefix since the library only speaks misfin
-        decide(message.request.recipient == "queen@127.0.0.1");
+        if (message.request.recipient == "queen@127.0.0.1")
+            decide(20, {});
+        else
+            decide(51, "mailbox does not exist");
     },
 
     // bind address
     "127.0.0.1");
 ```
+
+The trust callback receives the parsed recipient and TLS SNI name as well as
+the certificate. Rejecting it returns Misfin status 63. Once accepted, the
+delivery callback returns the exact Misfin status and meta, permitting policy
+and storage failures such as status 44. For a successful 2x response, Dr.Fin
+uses the server TLS certificate fingerprint as the response meta.
 
 Client:
 

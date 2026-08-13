@@ -11,6 +11,16 @@
 
 namespace drfin
 {
+// Everything needed to make a recipient-scoped TOFU decision. In particular,
+// the same sender certificate may be trusted by one local mailbox and unknown
+// or rejected by another.
+struct TrustRequest
+{
+    trantor::CertificatePtr sender;
+    std::string recipient;
+    std::string serverName;
+};
+
 struct IncomingMessage
 {
     Request request;
@@ -18,15 +28,20 @@ struct IncomingMessage
     std::string serverName;
 };
 
+using ServerIdentityReply = std::function<void(std::shared_ptr<const Credentials>)>;
+// The provider may load a credential asynchronously. It must invoke reply once;
+// nullptr rejects the TLS handshake.
 using ServerIdentityProvider =
-    std::function<std::shared_ptr<const Credentials>(const std::string &serverName)>;
+    std::function<void(std::string serverName, ServerIdentityReply reply)>;
 
 using TofuDecision = std::function<void(bool accept)>;
-using DeliveryDecision = std::function<void(bool accept)>;
+// The status and meta are validated before being sent. For a 2x response the
+// server substitutes its TLS certificate fingerprint as required by Misfin(B).
+using DeliveryDecision = std::function<void(int status, std::string meta)>;
 
 // Both handlers may save their decision callback and invoke it asynchronously.
 // Inputs are passed by value so they remain valid across suspension.
-using TofuHandler = std::function<void(trantor::CertificatePtr, TofuDecision)>;
+using TofuHandler = std::function<void(TrustRequest, TofuDecision)>;
 using DeliveryHandler = std::function<void(IncomingMessage, DeliveryDecision)>;
 
 class Server

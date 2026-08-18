@@ -175,7 +175,7 @@ std::optional<Url> parseMisfinRecipient(std::string_view recipient)
     const auto url = recipient.starts_with("misfin://")
                          ? Url::parse(recipient)
                          : Url::parse("misfin://" + std::string{recipient});
-    if (!url || url->scheme() != "misfin" || !isMailbox(url->userInfo()) || url->port() ||
+    if (!url || url->scheme() != "misfin" || !isMailbox(url->userInfo()) ||
         !url->path().empty() || !url->query().empty() ||
         !url->fragment().empty())
         return std::nullopt;

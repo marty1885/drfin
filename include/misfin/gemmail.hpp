@@ -24,9 +24,15 @@ struct Gemmail
     std::string body;
 
     static std::expected<Gemmail, std::string> parse(std::string_view text);
+    // Misfin(C) reserves its first three LF-terminated lines for sender,
+    // recipient, and timestamp metadata, even when a line is empty.
+    static std::expected<Gemmail, std::string> parseC(std::string_view text);
 
     // Produces canonical Gemmail: metadata first, followed by the body.
     std::string str() const;
+    // Produces the Misfin(C) form with exactly three metadata lines. C uses
+    // comma-separated recipient metadata rather than B's whitespace list.
+    std::string strC() const;
 
     // Returns the first Gemtext heading from the message body, if present.
     std::optional<std::string> subject() const;

@@ -23,7 +23,8 @@ namespace drfin
 namespace
 {
 std::expected<Response, std::string> parseResponse(const std::string &line,
-                                                    const std::string &fingerprint)
+                                                    const std::string &fingerprint,
+                                                    MisfinVersion version)
 {
     if (line.size() < 3 || line[2] != ' ')
         return std::unexpected("server sent an invalid Misfin response");
@@ -32,7 +33,7 @@ std::expected<Response, std::string> parseResponse(const std::string &line,
     if (error != std::errc{} || end != line.data() + 2 || !isMisfinResponseStatus(status))
         return std::unexpected("server sent an invalid Misfin response");
     const auto meta = line.substr(3);
-    if (status == 20)
+    if (status == 20 && version == MisfinVersion::B)
     {
         const auto deliveredTo = normalizeFingerprint(meta);
         if (fingerprint.empty() || deliveredTo.empty() || deliveredTo != fingerprint)
@@ -47,10 +48,11 @@ class Operation : public std::enable_shared_from_this<Operation>
     Operation(trantor::EventLoop &loop,
                Request request,
                Credentials credentials,
-               SendCallback callback,
-               ServerTrust trust)
+               DeliveryOutcomeCallback callback,
+               ServerTrust trust,
+               ConnectionPolicy connectionPolicy)
         : loop_(loop), request_(std::move(request)), credentials_(std::move(credentials)),
-          callback_(std::move(callback)), trust_(std::move(trust))
+                callback_(std::move(callback)), trust_(std::move(trust)), connectionPolicy_(std::move(connectionPolicy))
     {
     }
 
@@ -83,24 +85,44 @@ class Operation : public std::enable_shared_from_this<Operation>
             return finish(std::unexpected("recipient must be mailbox@hostname or misfin://mailbox@hostname"));
         if (request_.message.find('\r') != std::string::npos)
             return finish(std::unexpected("message must not contain CR; use LF line endings"));
+        if (!isValidUtf8(request_.message))
+            return finish(std::unexpected("message must be valid UTF-8"));
 
         recipient_ = recipient->userInfo() + "@" + recipient->host();
-        requestLine_ = "misfin://" + recipient_ + " " + request_.message + "\r\n";
-        if (requestLine_.size() > kMaxMisfinRequestSize)
-            return finish(std::unexpected("Misfin request exceeds 2048 bytes"));
+        if (recipient->port()) recipient_ += ":" + std::to_string(*recipient->port());
+        const std::string bRequest = "misfin://" + recipient_ + " " + request_.message + "\r\n";
+        const auto version = request_.version.value_or(
+            bRequest.size() <= kMaxMisfinRequestSize ? MisfinVersion::B : MisfinVersion::C);
+        version_ = version;
+        if (version == MisfinVersion::B)
+        {
+            if (bRequest.size() > kMaxMisfinRequestSize)
+                return finish(std::unexpected("Misfin(B) request exceeds 2048 bytes"));
+            requestBytes_ = bRequest;
+        }
+        else
+        {
+            if (request_.message.size() > kMaxMisfinCContentSize)
+                return finish(std::unexpected("Misfin(C) content exceeds 16384 bytes"));
+            const auto header = "misfin://" + recipient_ + "\t" + std::to_string(request_.message.size()) + "\r\n";
+            if (header.size() > kMaxMisfinCHeaderSize)
+                return finish(std::unexpected("Misfin(C) header exceeds 1024 bytes"));
+            requestBytes_ = header + request_.message;
+        }
 
         policy_ = trantor::TLSPolicy::defaultClientPolicy(recipient->host());
         policy_->setValidate(false)
             .setCertificatePem(credentials_.certificatePem, credentials_.privateKeyPem);
-        endpoint_ = recipient->host() + ":" + std::to_string(kMisfinPort);
-        auto ip = trantor::InetAddress(recipient->host(), kMisfinPort);
+        const auto port = recipient->port().value_or(kMisfinPort);
+        endpoint_ = recipient->host() + ":" + std::to_string(port);
+        auto ip = trantor::InetAddress(recipient->host(), port);
         if (!ip.isUnspecified())
             return sendInLoop(std::move(ip));
         if (recipient->host().size() > 2 && recipient->host().front() == '[' &&
             recipient->host().back() == ']')
         {
             ip = trantor::InetAddress(recipient->host().substr(1, recipient->host().size() - 2),
-                                      kMisfinPort,
+                                      port,
                                       true);
             if (!ip.isUnspecified())
                 return sendInLoop(std::move(ip));
@@ -134,6 +156,8 @@ class Operation : public std::enable_shared_from_this<Operation>
     {
         if (address.family() != AF_INET && address.family() != AF_INET6)
             return finish(std::unexpected("DNS lookup failed"));
+        if (!connectionPolicy_(endpoint_, address.toIp()))
+            return finish(std::unexpected("destination address is not permitted"));
         // TcpClient::connect() uses shared_from_this() internally.
         client_ = std::make_shared<trantor::TcpClient>(&loop_, std::move(address), "misfin-client");
         client_->enableSSL(std::move(policy_));
@@ -195,7 +219,7 @@ class Operation : public std::enable_shared_from_this<Operation>
                                      }
                                      self->sent_ = true;
                                      if (const auto connection = weakConnection.lock())
-                                         connection->send(self->requestLine_);
+                                        connection->send(self->requestBytes_);
                                      else
                                          self->finish(std::unexpected(
                                              "server closed before trust completed"));
@@ -223,7 +247,7 @@ class Operation : public std::enable_shared_from_this<Operation>
             const std::string line{buffer->peek(), static_cast<size_t>(crlf - buffer->peek())};
             buffer->retrieveUntil(crlf + 2);
             connection->shutdown();
-            self->finish(parseResponse(line, self->serverFingerprint_));
+            self->finish(parseResponse(line, self->serverFingerprint_, self->version_));
         });
         client_->connect();
     }
@@ -239,7 +263,7 @@ class Operation : public std::enable_shared_from_this<Operation>
             self->client_.reset();
             self->resolver_.reset();
             if (self->callback_)
-                self->callback_(std::move(result));
+                self->callback_({std::move(result), self->sent_});
             else
                 LOG_ERROR << "Misfin transaction completed without a callback";
             self->keepAlive_.reset();
@@ -249,18 +273,20 @@ class Operation : public std::enable_shared_from_this<Operation>
     trantor::EventLoop &loop_;
     Request request_;
     Credentials credentials_;
-    SendCallback callback_;
+    DeliveryOutcomeCallback callback_;
     ServerTrust trust_;
+    ConnectionPolicy connectionPolicy_;
     std::shared_ptr<trantor::TcpClient> client_;
     std::shared_ptr<trantor::Resolver> resolver_;
     std::shared_ptr<trantor::TLSPolicy> policy_;
     std::shared_ptr<Operation> keepAlive_;
-    std::string requestLine_;
+    std::string requestBytes_;
     std::string recipient_;
     std::string serverFingerprint_;
     std::string endpoint_;
     trantor::TimerId timeout_ = trantor::InvalidTimerId;
     bool trustStarted_ = false;
+    MisfinVersion version_ = MisfinVersion::B;
     bool sent_ = false;
     bool finished_ = false;
 };
@@ -270,7 +296,24 @@ void sendMail(Request request,
               Credentials credentials,
               SendCallback callback,
               ServerTrust trust,
+              ConnectionPolicy connectionPolicy,
               trantor::EventLoop *loop)
+{
+    if (!loop)
+        loop = drogon::app().getLoop();
+    sendMailDetailed(std::move(request), std::move(credentials),
+                     [callback = std::move(callback)](DeliveryOutcome outcome) mutable {
+                         callback(std::move(outcome.result));
+                     },
+                     std::move(trust), std::move(connectionPolicy), loop);
+}
+
+void sendMailDetailed(Request request,
+                      Credentials credentials,
+                      DeliveryOutcomeCallback callback,
+                      ServerTrust trust,
+                      ConnectionPolicy connectionPolicy,
+                      trantor::EventLoop *loop)
 {
     if (!loop)
         loop = drogon::app().getLoop();
@@ -278,13 +321,15 @@ void sendMail(Request request,
                                                   std::move(request),
                                                   std::move(credentials),
                                                   std::move(callback),
-                                                  std::move(trust));
+                                                  std::move(trust),
+                                                  std::move(connectionPolicy));
     loop->runInLoop([operation] { operation->start(); });
 }
 
 drogon::Task<Result> sendMailCoro(Request request,
                                   Credentials credentials,
                                   ServerTrust trust,
+                                  ConnectionPolicy connectionPolicy,
                                   trantor::EventLoop *loop)
 {
     struct State
@@ -296,6 +341,7 @@ drogon::Task<Result> sendMailCoro(Request request,
         Request request;
         Credentials credentials;
         ServerTrust trust;
+        ConnectionPolicy connectionPolicy;
         trantor::EventLoop *loop;
         std::shared_ptr<State> state;
 
@@ -311,14 +357,55 @@ drogon::Task<Result> sendMailCoro(Request request,
                              state->result.emplace(std::move(received));
                              continuation.resume();
                          }
-                      },
+                     },
                      std::move(trust),
+                     std::move(connectionPolicy),
                      loop);
         }
         Result await_resume() { return std::move(*state->result); }
     };
     auto state = std::make_shared<State>();
     co_return co_await Awaiter{
-        std::move(request), std::move(credentials), std::move(trust), loop, std::move(state)};
+        std::move(request), std::move(credentials), std::move(trust), std::move(connectionPolicy), loop, std::move(state)};
+}
+
+drogon::Task<DeliveryOutcome> sendMailDetailedCoro(Request request,
+                                                    Credentials credentials,
+                                                    ServerTrust trust,
+                                                    ConnectionPolicy connectionPolicy,
+                                                    trantor::EventLoop *loop)
+{
+    struct State
+    {
+        std::optional<DeliveryOutcome> result;
+    };
+    struct Awaiter
+    {
+        Request request;
+        Credentials credentials;
+        ServerTrust trust;
+        ConnectionPolicy connectionPolicy;
+        trantor::EventLoop *loop;
+        std::shared_ptr<State> state;
+
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> continuation)
+        {
+            const std::weak_ptr<State> weak = state;
+            sendMailDetailed(std::move(request), std::move(credentials),
+                             [weak, continuation](DeliveryOutcome received) mutable {
+                                 if (const auto state = weak.lock())
+                                 {
+                                     state->result.emplace(std::move(received));
+                                     continuation.resume();
+                                 }
+                             },
+                             std::move(trust), std::move(connectionPolicy), loop);
+        }
+        DeliveryOutcome await_resume() { return std::move(*state->result); }
+    };
+    auto state = std::make_shared<State>();
+    co_return co_await Awaiter{
+        std::move(request), std::move(credentials), std::move(trust), std::move(connectionPolicy), loop, std::move(state)};
 }
 }  // namespace drfin

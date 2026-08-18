@@ -13,6 +13,7 @@
 #include <trantor/utils/MsgBuffer.h>
 
 #include <optional>
+#include <charconv>
 #include <stdexcept>
 #include <atomic>
 #include <mutex>
@@ -54,7 +55,7 @@ std::string certificateBundle(const Credentials &identity)
     return identity.certificatePem + identity.privateKeyPem;
 }
 
-std::optional<Request> parseRequest(const std::string &line)
+std::optional<Request> parseBRequest(const std::string &line)
 {
     constexpr std::string_view scheme{"misfin://"};
     if (!line.starts_with(scheme) || line.find('\r') != std::string::npos)
@@ -65,7 +66,32 @@ std::optional<Request> parseRequest(const std::string &line)
     const std::string recipient = line.substr(scheme.size(), space - scheme.size());
     if (!parseMisfinRecipient(recipient))
         return std::nullopt;
-    return Request{recipient, line.substr(space + 1)};
+    return Request{recipient, line.substr(space + 1), MisfinVersion::B};
+}
+
+struct CHeader
+{
+    std::string recipient;
+    std::size_t contentSize;
+};
+
+std::optional<CHeader> parseCHeader(const std::string &line)
+{
+    constexpr std::string_view scheme{"misfin://"};
+    if (!line.starts_with(scheme) || line.find('\r') != std::string::npos)
+        return std::nullopt;
+    const auto tab = line.find('\t', scheme.size());
+    if (tab == std::string::npos || tab == scheme.size() || line.find('\t', tab + 1) != std::string::npos)
+        return std::nullopt;
+    const std::string recipient = line.substr(scheme.size(), tab - scheme.size());
+    if (!parseMisfinRecipient(recipient)) return std::nullopt;
+    std::size_t contentSize{};
+    const auto length = std::string_view{line}.substr(tab + 1);
+    const auto [end, error] = std::from_chars(length.data(), length.data() + length.size(), contentSize);
+    if (error != std::errc{} || end != length.data() + length.size() || contentSize == 0 ||
+        contentSize > kMaxMisfinCContentSize)
+        return std::nullopt;
+    return CHeader{recipient, contentSize};
 }
 
 struct ConnectionState
@@ -74,6 +100,8 @@ struct ConnectionState
     std::string fingerprint;
     std::string serverName;
     bool replied = false;
+    std::optional<CHeader> cHeader;
+    MisfinVersion version = MisfinVersion::B;
 };
 
 using DecisionOnce = std::shared_ptr<std::atomic_bool>;
@@ -199,16 +227,49 @@ class Listener : public std::enable_shared_from_this<Listener>
         }
         if (state->replied)
             return;
-        if (buffer->readableBytes() > kMaxMisfinRequestSize)
-            return reply(state, 59, "request exceeds 2048 bytes");
-        const auto *crlf = buffer->findCRLF();
-        if (crlf == nullptr)
-            return;
-        const std::string line{buffer->peek(), static_cast<size_t>(crlf - buffer->peek())};
-        buffer->retrieveUntil(crlf + 2);
-        const auto request = parseRequest(line);
-        if (!request)
-            return reply(state, 59, "bad request");
+        std::optional<Request> request;
+        if (state->cHeader)
+        {
+            if (buffer->readableBytes() > state->cHeader->contentSize)
+                return reply(state, 59, "Misfin(C) content exceeds declared length");
+            if (buffer->readableBytes() < state->cHeader->contentSize)
+                return;
+            std::string content{buffer->peek(), state->cHeader->contentSize};
+            buffer->retrieve(state->cHeader->contentSize);
+            if (content.find('\r') != std::string::npos || !isValidUtf8(content))
+                return reply(state, 59, "invalid Misfin(C) content");
+            request = Request{std::move(state->cHeader->recipient), std::move(content), MisfinVersion::C};
+        }
+        else
+        {
+            const auto *crlf = buffer->findCRLF();
+            if (crlf == nullptr)
+            {
+                if (buffer->readableBytes() > kMaxMisfinRequestSize)
+                    return reply(state, 59, "request header exceeds 2048 bytes");
+                return;
+            }
+            const std::string line{buffer->peek(), static_cast<size_t>(crlf - buffer->peek())};
+            constexpr std::string_view scheme{"misfin://"};
+            const auto separator = line.find_first_of(" \t", scheme.size());
+            if (separator != std::string::npos && line[separator] == '\t')
+            {
+                if (line.size() > kMaxMisfinCHeaderSize)
+                    return reply(state, 59, "Misfin(C) header exceeds 1024 bytes");
+                const auto header = parseCHeader(line);
+                if (!header)
+                    return reply(state, 59, "bad Misfin(C) request");
+                buffer->retrieveUntil(crlf + 2);
+                state->cHeader = *header;
+                return receive(connection, buffer);
+            }
+            if (line.size() + 2 > kMaxMisfinRequestSize || buffer->readableBytes() != line.size() + 2)
+                return reply(state, 59, "request exceeds 2048 bytes");
+            buffer->retrieveUntil(crlf + 2);
+            request = parseBRequest(line);
+            if (!request)
+                return reply(state, 59, "bad request");
+        }
 
         const auto peer = connection->peerCertificate();
         if (!peer)
@@ -217,13 +278,21 @@ class Listener : public std::enable_shared_from_this<Listener>
         if (state->fingerprint.empty())
             return reply(state, 50, "internal server error");
         state->serverName = connection->sniName();
+        state->version = *request->version;
 
         const auto deliveryPeer = peer;
+        // Materialize the recipient before moving the request into the
+        // asynchronous delivery continuation. Function-argument evaluation
+        // order is not a safe ownership boundary here: moving first leaves
+        // the TOFU callback with an empty recipient and makes it reject every
+        // otherwise valid sender certificate.
+        auto recipient = request->recipient;
+        auto incomingRequest = std::move(*request);
         const auto tofuDecision = std::make_shared<std::atomic_bool>(false);
         const std::weak_ptr<Listener> weak = shared_from_this();
         tofuHandler_(
-            {peer, request->recipient, state->serverName},
-            [weak, tofuDecision, state, request = *request, peer = std::move(deliveryPeer)](
+            {peer, std::move(recipient), state->serverName},
+            [weak, tofuDecision, state, request = std::move(incomingRequest), peer = std::move(deliveryPeer)](
                 bool accepted) mutable {
             const auto self = weak.lock();
             if (!self || !claimDecision(tofuDecision))
@@ -252,7 +321,7 @@ class Listener : public std::enable_shared_from_this<Listener>
                             const auto self = weak.lock();
                             if (!self)
                                 return;
-                            if (status / 10 == 2)
+                            if (status / 10 == 2 && state->version == MisfinVersion::B)
                                 reply(state, status, state->fingerprint);
                             else
                                 reply(state, status, meta);
@@ -311,7 +380,7 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
                     auto *loop = drogon::app().getIOLoop(i);
                     loop->runInLoop([weak,
                                        loop,
-                                        identityProvider,
+                                       identityProvider,
                                        tofuHandler,
                                        deliveryHandler,
                                        address,

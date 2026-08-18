@@ -31,6 +31,6 @@ class Url
     std::string fragment_;
 };
 
-// Parses mailbox@hostname or misfin://mailbox@hostname.
+// Parses mailbox@hostname[:port] or misfin://mailbox@hostname[:port].
 std::optional<Url> parseMisfinRecipient(std::string_view recipient);
 }  // namespace drfin

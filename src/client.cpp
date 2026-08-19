@@ -19,6 +19,7 @@
 #include <cctype>
 #include <exception>
 #include <utility>
+#include <vector>
 
 namespace drfin
 {
@@ -118,14 +119,12 @@ class Operation : public std::enable_shared_from_this<Operation>
             requestBytes_ = header + request_.message;
         }
 
-        policy_ = trantor::TLSPolicy::defaultClientPolicy(recipient->host());
-        policy_->setValidate(false)
-            .setCertificatePem(credentials_.certificatePem, credentials_.privateKeyPem);
         const auto port = recipient->port().value_or(kMisfinPort);
+        tlsServerName_ = recipient->host();
         endpoint_ = recipient->host() + ":" + std::to_string(port);
         auto ip = trantor::InetAddress(recipient->host(), port);
         if (!ip.isUnspecified())
-            return sendInLoop(std::move(ip));
+            return startCandidates({std::move(ip)});
         if (recipient->host().size() > 2 && recipient->host().front() == '[' &&
             recipient->host().back() == ']')
         {
@@ -133,79 +132,117 @@ class Operation : public std::enable_shared_from_this<Operation>
                                       port,
                                       true);
             if (!ip.isUnspecified())
-                return sendInLoop(std::move(ip));
+                return startCandidates({std::move(ip)});
         }
         resolver_ = trantor::Resolver::newResolver(&loop_);
         stage_ = "resolving DNS";
-        LOG_DEBUG << "Misfin outbound stage: resolving DNS";
         resolver_->resolve(
             recipient->host(),
-            trantor::Resolver::Callback{[weak = weak_from_this(), port](const auto &address) {
-                // NormalResolver invokes callbacks from its worker thread.  TcpClient
-                // and its Connector must only be created on the owning event loop.
-                if (const auto self = weak.lock())
-                {
-                    const auto endpoint = trantor::InetAddress(address.toIp(), port, address.isIpV6());
-                    self->loop_.queueInLoop([weak, endpoint] {
-                        if (const auto operation = weak.lock())
-                            operation->sendInLoop(endpoint);
-                    });
-                }
-            }});
+            trantor::Resolver::ResolverResultsCallback{
+                [weak = weak_from_this(), port](const std::vector<trantor::InetAddress> &addresses) {
+                    // NormalResolver invokes callbacks from its worker thread. TcpClient
+                    // and its Connector must only be created on the owning event loop.
+                    if (const auto self = weak.lock())
+                    {
+                        std::vector<trantor::InetAddress> endpoints;
+                        endpoints.reserve(addresses.size());
+                        for (const auto &address : addresses)
+                        {
+                            if (address.family() == AF_INET || address.family() == AF_INET6)
+                                endpoints.emplace_back(address.toIp(), port, address.isIpV6());
+                        }
+                        self->loop_.queueInLoop([weak, endpoints = std::move(endpoints)]() mutable {
+                            if (const auto operation = weak.lock())
+                                operation->startCandidates(std::move(endpoints));
+                        });
+                    }
+                }});
     }
 
-    void sendInLoop(trantor::InetAddress address)
+    [[nodiscard]] std::shared_ptr<trantor::TLSPolicy> makePolicy() const
     {
-        try
-        {
-            sendInLoopImpl(std::move(address));
-        }
-        catch (const std::exception &error)
-        {
-            finish(std::unexpected(error.what()));
-        }
-        catch (...)
-        {
-            finish(std::unexpected("failed to connect Misfin transaction"));
-        }
+        auto policy = trantor::TLSPolicy::defaultClientPolicy(tlsServerName_);
+        policy->setValidate(false)
+            .setCertificatePem(credentials_.certificatePem, credentials_.privateKeyPem);
+        return policy;
     }
 
-    void sendInLoopImpl(trantor::InetAddress address)
+    void startCandidates(std::vector<trantor::InetAddress> addresses)
     {
-        if (address.family() != AF_INET && address.family() != AF_INET6)
+        if (addresses.empty())
             return finish(std::unexpected("DNS lookup failed"));
+
+        std::vector<trantor::InetAddress> ipv6;
+        std::vector<trantor::InetAddress> ipv4;
+        for (auto &address : addresses)
+        {
+            if (address.family() == AF_INET6)
+                ipv6.push_back(std::move(address));
+            else if (address.family() == AF_INET)
+                ipv4.push_back(std::move(address));
+        }
+        candidates_.clear();
+        candidates_.reserve(ipv4.size() + ipv6.size());
+        for (std::size_t index = 0; index < std::max(ipv6.size(), ipv4.size()); ++index)
+        {
+            if (index < ipv6.size()) candidates_.push_back(std::move(ipv6[index]));
+            if (index < ipv4.size()) candidates_.push_back(std::move(ipv4[index]));
+        }
+        if (candidates_.empty())
+            return finish(std::unexpected("DNS lookup returned no Internet address"));
+
+        candidateStates_.assign(candidates_.size(), CandidateState::Pending);
+        clients_.resize(candidates_.size());
+        candidateTimers_.resize(candidates_.size(), trantor::InvalidTimerId);
+        startCandidate(0);
+        for (std::size_t index = 1; index < candidates_.size(); ++index)
+        {
+            candidateTimers_[index] = loop_.runAfter(
+                0.25 * static_cast<double>(index), [weak = weak_from_this(), index] {
+                    if (const auto self = weak.lock()) self->startCandidate(index);
+                });
+        }
+    }
+
+    void startCandidate(std::size_t index)
+    {
+        if (finished_ || winner_ || index >= candidates_.size() || candidateStates_[index] != CandidateState::Pending)
+            return;
+        const auto &address = candidates_[index];
+        candidateStates_[index] = CandidateState::Connecting;
         if (!connectionPolicy_(endpoint_, address.toIp()))
-            return finish(std::unexpected("destination address is not permitted"));
+            return candidateFailed(index, "destination address is not permitted");
         stage_ = "connecting to recipient";
-        LOG_DEBUG << "Misfin outbound stage: connecting";
         // TcpClient::connect() uses shared_from_this() internally.
-        client_ = std::make_shared<trantor::TcpClient>(&loop_, std::move(address), "misfin-client");
-        client_->enableSSL(std::move(policy_));
+        auto client = std::make_shared<trantor::TcpClient>(&loop_, address, "misfin-client");
+        clients_[index] = client;
+        client->enableSSL(makePolicy());
         const auto weak = weak_from_this();
-        client_->setConnectionErrorCallback([weak] {
-            if (const auto self = weak.lock())
-                self->finish(std::unexpected("TCP connection failed"));
+        client->setConnectionErrorCallback([weak, index] {
+            if (const auto self = weak.lock()) self->candidateFailed(index, "TCP connection failed");
         });
-        client_->setSSLErrorCallback([weak](trantor::SSLError) {
-            if (const auto self = weak.lock())
-                self->finish(std::unexpected("TLS handshake failed"));
+        client->setSSLErrorCallback([weak, index](trantor::SSLError) {
+            if (const auto self = weak.lock()) self->candidateFailed(index, "TLS handshake failed");
         });
-        client_->setConnectionCallback([weak](const auto &connection) {
+        client->setConnectionCallback([weak, index](const auto &connection) {
             const auto self = weak.lock();
-            if (!self)
+            if (!self || self->finished_)
                 return;
             if (!connection->connected())
             {
-                self->finish(std::unexpected("server closed before sending a response"));
+                self->candidateFailed(index, "server closed during TLS handshake");
                 return;
             }
-            if (self->trustStarted_)
+            if (self->winner_)
                 return;
+            self->winner_ = index;
+            self->candidateStates_[index] = CandidateState::Winner;
+            self->cancelCandidateTimers();
+            self->disconnectLosers(index);
             const auto certificate = connection->peerCertificate();
             if (!certificate)
                 return self->finish(std::unexpected("server did not provide a certificate"));
             self->stage_ = "checking server certificate";
-            LOG_DEBUG << "Misfin outbound stage: TLS established; awaiting trust decision";
             self->trustStarted_ = true;
             self->serverFingerprint_ = normalizeFingerprint(certificate->sha256Fingerprint());
             const auto decision = std::make_shared<std::atomic_bool>(false);
@@ -230,27 +267,24 @@ class Operation : public std::enable_shared_from_this<Operation>
                                  }
                                  self->loop_.runInLoop([weak, weakConnection, accepted] {
                                      const auto self = weak.lock();
-                                     if (!self)
+                                     if (!self || self->finished_ || !self->winner_)
                                          return;
                                      if (!accepted)
                                      {
-                                         if (const auto client = self->client_)
+                                         if (const auto &client = self->clients_[*self->winner_])
                                              client->disconnect();
                                          return self->finish(
                                              std::unexpected("server certificate declined"));
                                      }
-                                    self->stage_ = "sending request";
-                                    LOG_DEBUG << "Misfin outbound stage: trust accepted; sending request";
-                                    self->sent_ = true;
-                                    if (const auto connection = weakConnection.lock())
-                                    {
+                                     self->stage_ = "sending request";
+                                     self->sent_ = true;
+                                     if (const auto connection = weakConnection.lock())
+                                     {
                                         connection->send(self->requestBytes_);
                                         self->stage_ = "waiting for server response";
-                                        LOG_DEBUG << "Misfin outbound stage: request sent; awaiting response";
-                                    }
-                                    else
-                                         self->finish(std::unexpected(
-                                             "server closed before trust completed"));
+                                     }
+                                     else
+                                         self->finish(std::unexpected("server closed before trust completed"));
                                  });
                              });
             }
@@ -263,7 +297,7 @@ class Operation : public std::enable_shared_from_this<Operation>
                 self->finish(std::unexpected("server trust callback failed"));
             }
         });
-        client_->setMessageCallback([weak](const auto &connection, auto *buffer) {
+        client->setMessageCallback([weak](const auto &connection, auto *buffer) {
             const auto self = weak.lock();
             if (!self)
                 return;
@@ -274,11 +308,51 @@ class Operation : public std::enable_shared_from_this<Operation>
                 return;
             const std::string line{buffer->peek(), static_cast<size_t>(crlf - buffer->peek())};
             buffer->retrieveUntil(crlf + 2);
-            LOG_DEBUG << "Misfin outbound stage: response received";
             connection->shutdown();
             self->finish(parseResponse(line, self->serverFingerprint_, self->version_));
         });
-        client_->connect();
+        client->connect();
+    }
+
+    void candidateFailed(std::size_t index, std::string reason)
+    {
+        if (finished_ || winner_ || index >= candidateStates_.size() ||
+            candidateStates_[index] != CandidateState::Connecting)
+            return;
+        candidateStates_[index] = CandidateState::Failed;
+        clients_[index].reset();
+        lastCandidateFailure_ = std::move(reason);
+        for (std::size_t next = 0; next < candidateStates_.size(); ++next)
+        {
+            if (candidateStates_[next] == CandidateState::Pending)
+            {
+                startCandidate(next);
+                return;
+            }
+        }
+        if (std::all_of(candidateStates_.begin(), candidateStates_.end(), [](CandidateState state) {
+                return state == CandidateState::Failed;
+            }))
+            finish(std::unexpected(lastCandidateFailure_));
+    }
+
+    void cancelCandidateTimers()
+    {
+        for (const auto timer : candidateTimers_)
+        {
+            if (timer != trantor::InvalidTimerId)
+                loop_.invalidateTimer(timer);
+        }
+        candidateTimers_.clear();
+    }
+
+    void disconnectLosers(std::size_t winner)
+    {
+        for (std::size_t index = 0; index < clients_.size(); ++index)
+        {
+            if (index != winner && clients_[index])
+                clients_[index]->disconnect();
+        }
     }
 
     void finish(Result result)
@@ -287,9 +361,10 @@ class Operation : public std::enable_shared_from_this<Operation>
             return;
         finished_ = true;
         loop_.invalidateTimer(timeout_);
+        cancelCandidateTimers();
         auto self = shared_from_this();
         loop_.runInLoop([self, result = std::move(result)]() mutable {
-            self->client_.reset();
+            self->clients_.clear();
             self->resolver_.reset();
             if (self->callback_)
                 self->callback_({std::move(result), self->sent_});
@@ -305,13 +380,25 @@ class Operation : public std::enable_shared_from_this<Operation>
     DeliveryOutcomeCallback callback_;
     ServerTrust trust_;
     ConnectionPolicy connectionPolicy_;
-    std::shared_ptr<trantor::TcpClient> client_;
     std::shared_ptr<trantor::Resolver> resolver_;
-    std::shared_ptr<trantor::TLSPolicy> policy_;
     std::shared_ptr<Operation> keepAlive_;
+    enum class CandidateState
+    {
+        Pending,
+        Connecting,
+        Failed,
+        Winner,
+    };
+    std::vector<trantor::InetAddress> candidates_;
+    std::vector<CandidateState> candidateStates_;
+    std::vector<std::shared_ptr<trantor::TcpClient>> clients_;
+    std::vector<trantor::TimerId> candidateTimers_;
+    std::optional<std::size_t> winner_;
+    std::string lastCandidateFailure_ = "all recipient addresses failed";
     std::string requestBytes_;
     std::string recipient_;
     std::string serverFingerprint_;
+    std::string tlsServerName_;
     std::string endpoint_;
     std::string stage_ = "starting transaction";
     trantor::TimerId timeout_ = trantor::InvalidTimerId;

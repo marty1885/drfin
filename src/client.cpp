@@ -69,7 +69,7 @@ class Operation : public std::enable_shared_from_this<Operation>
         keepAlive_ = shared_from_this();
         timeout_ = loop_.runAfter(kMisfinTransactionTimeout, [weak = weak_from_this()] {
             if (const auto self = weak.lock())
-                self->finish(std::unexpected("Misfin transaction timed out"));
+                self->finish(std::unexpected("Misfin transaction timed out while " + self->stage_));
         });
         try
         {
@@ -136,6 +136,8 @@ class Operation : public std::enable_shared_from_this<Operation>
                 return sendInLoop(std::move(ip));
         }
         resolver_ = trantor::Resolver::newResolver(&loop_);
+        stage_ = "resolving DNS";
+        LOG_DEBUG << "Misfin outbound stage: resolving DNS";
         resolver_->resolve(
             recipient->host(),
             trantor::Resolver::Callback{[weak = weak_from_this(), port](const auto &address) {
@@ -174,6 +176,8 @@ class Operation : public std::enable_shared_from_this<Operation>
             return finish(std::unexpected("DNS lookup failed"));
         if (!connectionPolicy_(endpoint_, address.toIp()))
             return finish(std::unexpected("destination address is not permitted"));
+        stage_ = "connecting to recipient";
+        LOG_DEBUG << "Misfin outbound stage: connecting";
         // TcpClient::connect() uses shared_from_this() internally.
         client_ = std::make_shared<trantor::TcpClient>(&loop_, std::move(address), "misfin-client");
         client_->enableSSL(std::move(policy_));
@@ -200,6 +204,8 @@ class Operation : public std::enable_shared_from_this<Operation>
             const auto certificate = connection->peerCertificate();
             if (!certificate)
                 return self->finish(std::unexpected("server did not provide a certificate"));
+            self->stage_ = "checking server certificate";
+            LOG_DEBUG << "Misfin outbound stage: TLS established; awaiting trust decision";
             self->trustStarted_ = true;
             self->serverFingerprint_ = normalizeFingerprint(certificate->sha256Fingerprint());
             const auto decision = std::make_shared<std::atomic_bool>(false);
@@ -233,10 +239,16 @@ class Operation : public std::enable_shared_from_this<Operation>
                                          return self->finish(
                                              std::unexpected("server certificate declined"));
                                      }
-                                     self->sent_ = true;
-                                     if (const auto connection = weakConnection.lock())
+                                    self->stage_ = "sending request";
+                                    LOG_DEBUG << "Misfin outbound stage: trust accepted; sending request";
+                                    self->sent_ = true;
+                                    if (const auto connection = weakConnection.lock())
+                                    {
                                         connection->send(self->requestBytes_);
-                                     else
+                                        self->stage_ = "waiting for server response";
+                                        LOG_DEBUG << "Misfin outbound stage: request sent; awaiting response";
+                                    }
+                                    else
                                          self->finish(std::unexpected(
                                              "server closed before trust completed"));
                                  });
@@ -262,6 +274,7 @@ class Operation : public std::enable_shared_from_this<Operation>
                 return;
             const std::string line{buffer->peek(), static_cast<size_t>(crlf - buffer->peek())};
             buffer->retrieveUntil(crlf + 2);
+            LOG_DEBUG << "Misfin outbound stage: response received";
             connection->shutdown();
             self->finish(parseResponse(line, self->serverFingerprint_, self->version_));
         });
@@ -300,6 +313,7 @@ class Operation : public std::enable_shared_from_this<Operation>
     std::string recipient_;
     std::string serverFingerprint_;
     std::string endpoint_;
+    std::string stage_ = "starting transaction";
     trantor::TimerId timeout_ = trantor::InvalidTimerId;
     bool trustStarted_ = false;
     MisfinVersion version_ = MisfinVersion::B;

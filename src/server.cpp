@@ -321,10 +321,7 @@ class Listener : public std::enable_shared_from_this<Listener>
                             const auto self = weak.lock();
                             if (!self)
                                 return;
-                            if (status / 10 == 2 && state->version == MisfinVersion::B)
-                                reply(state, status, state->fingerprint);
-                            else
-                                reply(state, status, meta);
+                            reply(state, status, meta);
                         });
                     });
             });

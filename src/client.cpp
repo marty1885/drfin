@@ -12,9 +12,11 @@
 #include <trantor/utils/Logger.h>
 #include <trantor/utils/MsgBuffer.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <charconv>
+#include <cctype>
 #include <exception>
 #include <utility>
 
@@ -35,9 +37,15 @@ std::expected<Response, std::string> parseResponse(const std::string &line,
     const auto meta = line.substr(3);
     if (status == 20 && version == MisfinVersion::B)
     {
+        // Misfin(B) returns the recipient mailbox certificate fingerprint, not
+        // necessarily the TLS server certificate fingerprint. Hosted mailboxes
+        // commonly use a different certificate for each recipient.
         const auto deliveredTo = normalizeFingerprint(meta);
-        if (fingerprint.empty() || deliveredTo.empty() || deliveredTo != fingerprint)
-            return std::unexpected("server response fingerprint does not match its TLS certificate");
+        if (deliveredTo.size() != 64 ||
+            std::any_of(deliveredTo.begin(), deliveredTo.end(), [](unsigned char character) {
+                return !std::isxdigit(character);
+            }))
+            return std::unexpected("server sent an invalid recipient certificate fingerprint");
     }
     return Response{status, meta, fingerprint};
 }
@@ -130,9 +138,17 @@ class Operation : public std::enable_shared_from_this<Operation>
         resolver_ = trantor::Resolver::newResolver(&loop_);
         resolver_->resolve(
             recipient->host(),
-            trantor::Resolver::Callback{[weak = weak_from_this()](const auto &address) {
+            trantor::Resolver::Callback{[weak = weak_from_this(), port](const auto &address) {
+                // NormalResolver invokes callbacks from its worker thread.  TcpClient
+                // and its Connector must only be created on the owning event loop.
                 if (const auto self = weak.lock())
-                    self->sendInLoop(address);
+                {
+                    const auto endpoint = trantor::InetAddress(address.toIp(), port, address.isIpV6());
+                    self->loop_.queueInLoop([weak, endpoint] {
+                        if (const auto operation = weak.lock())
+                            operation->sendInLoop(endpoint);
+                    });
+                }
             }});
     }
 

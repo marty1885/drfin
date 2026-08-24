@@ -162,8 +162,11 @@ class Operation : public std::enable_shared_from_this<Operation>
     [[nodiscard]] std::shared_ptr<trantor::TLSPolicy> makePolicy() const
     {
         auto policy = trantor::TLSPolicy::defaultClientPolicy(tlsServerName_);
+        const auto &keyPem = credentials_.privateKeyPem.empty()
+                                 ? credentials_.certificatePem
+                                 : credentials_.privateKeyPem;
         policy->setValidate(false)
-            .setCertificatePem(credentials_.certificatePem, credentials_.privateKeyPem);
+            .setCertificatePem(credentials_.certificatePem, keyPem);
         return policy;
     }
 
@@ -230,6 +233,8 @@ class Operation : public std::enable_shared_from_this<Operation>
                 return;
             if (!connection->connected())
             {
+                if (self->winner_ && *self->winner_ == index)
+                    return self->finish(std::unexpected("connection closed by server"));
                 self->candidateFailed(index, "server closed during TLS handshake");
                 return;
             }
@@ -277,11 +282,11 @@ class Operation : public std::enable_shared_from_this<Operation>
                                              std::unexpected("server certificate declined"));
                                      }
                                      self->stage_ = "sending request";
-                                     self->sent_ = true;
                                      if (const auto connection = weakConnection.lock())
                                      {
-                                        connection->send(self->requestBytes_);
-                                        self->stage_ = "waiting for server response";
+                                         self->sent_ = true;
+                                         connection->send(self->requestBytes_);
+                                         self->stage_ = "waiting for server response";
                                      }
                                      else
                                          self->finish(std::unexpected("server closed before trust completed"));

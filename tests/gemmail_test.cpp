@@ -41,6 +41,16 @@ int main()
     assert(!drfin::Gemmail{.body = "###"}.subject());
     assert(!drfin::Gemmail{.body = ""}.subject());
     assert(!drfin::Gemmail::parse("text\r\n").has_value());
+    assert(!drfin::Gemmail{.body = "```\n# code comment\n```\n"}.subject());
+    assert(drfin::Gemmail{.body = "```\n# code comment\n```\n# Subject\n"}.subject() == "Subject");
+    const drfin::Gemmail unsafeMetadata{
+        .sender = drfin::GemmailAddress{"bee@hive.example", "Bee\nInjected"},
+        .recipients = {"queen@hive.example\r\n@ injected"},
+        .timestamp = "now\n< injected"};
+    assert(unsafeMetadata.str() ==
+           "< bee@hive.example Bee Injected\n: queen@hive.example  @ injected\n@ now < injected\n");
+    assert(unsafeMetadata.strC() ==
+           "< bee@hive.example Bee Injected\n: queen@hive.example  @ injected\n@ now < injected\n");
     assert(!drfin::Gemmail::parse("< not-an-address\n").has_value());
     assert(!drfin::Gemmail::parse(": not-an-address\n").has_value());
     assert(drfin::Gemmail::parse("< bee@hive.example:1958\n").has_value());

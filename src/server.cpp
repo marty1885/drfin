@@ -123,6 +123,8 @@ void reply(const std::shared_ptr<ConnectionState> &state,
     if (state->replied)
         return;
     std::string responseMeta = meta;
+    if (status == 20 && state->version == MisfinVersion::B && responseMeta.empty())
+        responseMeta = state->fingerprint;
     if (!isMisfinResponseStatus(status) || responseMeta.find_first_of("\r\n") != std::string::npos)
     {
         LOG_ERROR << "Misfin server attempted an invalid response";
@@ -139,7 +141,6 @@ void reply(const std::shared_ptr<ConnectionState> &state,
     if (const auto connection = state->connection.lock())
     {
         connection->send(response);
-        connection->clearContext();
         // Misfin is exactly one request and one response per TLS connection.
         // shutdown() flushes the queued response, then sends close_notify and
         // closes the write side; clients must not wait indefinitely for EOF.
@@ -165,6 +166,7 @@ class Listener : public std::enable_shared_from_this<Listener>
     {
         server_ = std::make_unique<trantor::TcpServer>(
             &loop_, trantor::InetAddress(address, port), "misfin-server", true, true);
+        server_->kickoffIdleConnections(static_cast<size_t>(kMisfinTransactionTimeout));
 
         // Request, but do not TLS-validate, sender certificates. Misfin's
         // asynchronous TOFU handler decides trust after the handshake.
@@ -269,6 +271,8 @@ class Listener : public std::enable_shared_from_this<Listener>
             request = parseBRequest(line);
             if (!request)
                 return reply(state, 59, "bad request");
+            if (!isValidUtf8(request->message))
+                return reply(state, 59, "invalid UTF-8 message");
         }
 
         const auto peer = connection->peerCertificate();
@@ -290,10 +294,12 @@ class Listener : public std::enable_shared_from_this<Listener>
         auto incomingRequest = std::move(*request);
         const auto tofuDecision = std::make_shared<std::atomic_bool>(false);
         const std::weak_ptr<Listener> weak = shared_from_this();
-        tofuHandler_(
-            {peer, std::move(recipient), state->serverName},
-            [weak, tofuDecision, state, request = std::move(incomingRequest), peer = std::move(deliveryPeer)](
-                bool accepted) mutable {
+        try
+        {
+            tofuHandler_(
+                {peer, std::move(recipient), state->serverName},
+                [weak, tofuDecision, state, request = std::move(incomingRequest), peer = std::move(deliveryPeer)](
+                    bool accepted) mutable {
             const auto self = weak.lock();
             if (!self || !claimDecision(tofuDecision))
                 return;
@@ -308,9 +314,11 @@ class Listener : public std::enable_shared_from_this<Listener>
                 if (!accepted)
                     return reply(state, 63, "certificate declined");
                 const auto deliveryDecision = std::make_shared<std::atomic_bool>(false);
-                self->deliveryHandler_(
-                    {std::move(request), std::move(peer), state->serverName},
-                    [weak, deliveryDecision, state](int status, std::string meta) {
+                try
+                {
+                    self->deliveryHandler_(
+                        {std::move(request), std::move(peer), state->serverName},
+                        [weak, deliveryDecision, state](int status, std::string meta) {
                         const auto self = weak.lock();
                         if (!self || !claimDecision(deliveryDecision))
                             return;
@@ -323,9 +331,31 @@ class Listener : public std::enable_shared_from_this<Listener>
                                 return;
                             reply(state, status, meta);
                         });
-                    });
+                        });
+                }
+                catch (const std::exception &error)
+                {
+                    LOG_ERROR << "Misfin delivery handler threw exception: " << error.what();
+                    reply(state, 50, "internal server error");
+                }
+                catch (...)
+                {
+                    LOG_ERROR << "Misfin delivery handler threw an unknown exception";
+                    reply(state, 50, "internal server error");
+                }
             });
-        });
+                });
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR << "Misfin TOFU handler threw exception: " << error.what();
+            reply(state, 50, "internal server error");
+        }
+        catch (...)
+        {
+            LOG_ERROR << "Misfin TOFU handler threw an unknown exception";
+            reply(state, 50, "internal server error");
+        }
     }
 
     trantor::EventLoop &loop_;

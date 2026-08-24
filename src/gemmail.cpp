@@ -1,8 +1,9 @@
 #include <misfin/gemmail.hpp>
 #include <misfin/url.hpp>
 
-#include <cctype>
 #include <array>
+#include <algorithm>
+#include <cctype>
 
 namespace drfin
 {
@@ -77,6 +78,14 @@ bool isHeading(std::string_view line)
     if (text == std::string_view::npos || text > 3)
         return false;
     return line[text] == ' ';
+}
+
+std::string sanitizeMetadata(std::string_view value)
+{
+    std::string sanitized{value};
+    std::replace(sanitized.begin(), sanitized.end(), '\r', ' ');
+    std::replace(sanitized.begin(), sanitized.end(), '\n', ' ');
+    return sanitized;
 }
 }  // namespace
 
@@ -189,9 +198,9 @@ std::string Gemmail::str() const
     std::string text;
     if (sender)
     {
-        text += "< " + sender->address;
+        text += "< " + sanitizeMetadata(sender->address);
         if (!sender->blurb.empty())
-            text += " " + sender->blurb;
+            text += " " + sanitizeMetadata(sender->blurb);
         text += '\n';
     }
     if (!recipients.empty())
@@ -201,12 +210,12 @@ std::string Gemmail::str() const
         {
             if (i != 0)
                 text += ' ';
-            text += recipients[i];
+            text += sanitizeMetadata(recipients[i]);
         }
         text += '\n';
     }
     if (timestamp)
-        text += "@ " + *timestamp + "\n";
+        text += "@ " + sanitizeMetadata(*timestamp) + "\n";
     return text + body;
 }
 
@@ -215,8 +224,8 @@ std::string Gemmail::strC() const
     std::string text;
     if (sender)
     {
-        text += "< " + sender->address;
-        if (!sender->blurb.empty()) text += " " + sender->blurb;
+        text += "< " + sanitizeMetadata(sender->address);
+        if (!sender->blurb.empty()) text += " " + sanitizeMetadata(sender->blurb);
     }
     text += '\n';
     if (!recipients.empty())
@@ -225,11 +234,11 @@ std::string Gemmail::strC() const
         for (size_t index = 0; index < recipients.size(); ++index)
         {
             if (index != 0) text += ", ";
-            text += recipients[index];
+            text += sanitizeMetadata(recipients[index]);
         }
     }
     text += '\n';
-    if (timestamp) text += "@ " + *timestamp;
+    if (timestamp) text += "@ " + sanitizeMetadata(*timestamp);
     text += '\n';
     return text + body;
 }
@@ -237,11 +246,14 @@ std::string Gemmail::strC() const
 std::optional<std::string> Gemmail::subject() const
 {
     size_t start = 0;
+    bool preformatted = false;
     while (start < body.size())
     {
         const auto end = body.find('\n', start);
         const auto line = std::string_view{body}.substr(start, end == std::string::npos ? end : end - start);
-        if (isHeading(line))
+        if (line.starts_with("```"))
+            preformatted = !preformatted;
+        else if (!preformatted && isHeading(line))
             return std::string{line.substr(line.find(' ') + 1)};
         if (end == std::string::npos)
             break;

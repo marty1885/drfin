@@ -98,6 +98,10 @@ std::optional<Url> Url::parse(std::string_view text)
         url.userInfo_ = authority.substr(0, at);
         authority.remove_prefix(at + 1);
     }
+    // The authority may have consisted solely of user info (for example,
+    // "misfin://user@").  Check before inspecting its first character.
+    if (authority.empty())
+        return std::nullopt;
     if (authority.front() == '[')
     {
         const auto closingBracket = authority.find(']');

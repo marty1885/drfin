@@ -61,6 +61,8 @@ int main()
     assert(canonicalRecipient->host() == "hive.example");
     assert(!drfin::parseMisfinRecipient("queen@@hive.example"));
     assert(!drfin::parseMisfinRecipient("gemini://queen@hive.example"));
+    assert(!drfin::parseMisfinRecipient("misfin://attacker@"));
+    assert(!drfin::Url::parse("misfin://attacker@/message"));
     const auto customPort = drfin::parseMisfinRecipient("queen@hive.example:1960");
     assert(customPort && customPort->port() == 1960);
     assert(!drfin::parseMisfinRecipient("queen@hive.example/path"));

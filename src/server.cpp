@@ -52,6 +52,8 @@ std::string certificateBundle(const Credentials &identity)
 {
     if (identity.privateKeyPem.empty() || identity.privateKeyPem == identity.certificatePem)
         return identity.certificatePem;
+    if (!identity.certificatePem.empty() && identity.certificatePem.back() != '\n')
+        return identity.certificatePem + "\n" + identity.privateKeyPem;
     return identity.certificatePem + identity.privateKeyPem;
 }
 

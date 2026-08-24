@@ -101,6 +101,7 @@ struct ConnectionState
     std::weak_ptr<trantor::TcpConnection> connection;
     std::string fingerprint;
     std::string serverName;
+    bool processing = false;
     bool replied = false;
     std::optional<CHeader> cHeader;
     MisfinVersion version = MisfinVersion::B;
@@ -140,6 +141,7 @@ void reply(const std::shared_ptr<ConnectionState> &state,
         response = "50 internal server error\r\n";
     }
     state->replied = true;
+    state->processing = false;
     if (const auto connection = state->connection.lock())
     {
         connection->send(response);
@@ -231,6 +233,11 @@ class Listener : public std::enable_shared_from_this<Listener>
         }
         if (state->replied)
             return;
+        // Misfin permits exactly one request per connection.  The request may
+        // be awaiting asynchronous certificate or delivery work, but it has
+        // already consumed this connection's sole request slot.
+        if (state->processing)
+            return reply(state, 59, "multiple requests on one connection");
         std::optional<Request> request;
         if (state->cHeader)
         {
@@ -243,6 +250,7 @@ class Listener : public std::enable_shared_from_this<Listener>
             if (content.find('\r') != std::string::npos || !isValidUtf8(content))
                 return reply(state, 59, "invalid Misfin(C) content");
             request = Request{std::move(state->cHeader->recipient), std::move(content), MisfinVersion::C};
+            state->cHeader.reset();
         }
         else
         {
@@ -277,6 +285,8 @@ class Listener : public std::enable_shared_from_this<Listener>
                 return reply(state, 59, "invalid UTF-8 message");
         }
 
+        state->processing = true;
+
         const auto peer = connection->peerCertificate();
         if (!peer)
             return reply(state, 60, "certificate required");
@@ -302,7 +312,7 @@ class Listener : public std::enable_shared_from_this<Listener>
                 {peer, std::move(recipient), state->serverName},
                 [weak, tofuDecision, state, request = std::move(incomingRequest), peer = std::move(deliveryPeer)](
                     bool accepted) mutable {
-            const auto self = weak.lock();
+                const auto self = weak.lock();
             if (!self || !claimDecision(tofuDecision))
                 return;
             self->loop_.runInLoop([weak,
@@ -312,6 +322,11 @@ class Listener : public std::enable_shared_from_this<Listener>
                                      accepted] {
                 const auto self = weak.lock();
                 if (!self)
+                    return;
+                // The connection may have been rejected for receiving more
+                // data while this asynchronous decision was outstanding.
+                // Do not start delivery after that rejection.
+                if (!state->processing)
                     return;
                 if (!accepted)
                     return reply(state, 63, "certificate declined");

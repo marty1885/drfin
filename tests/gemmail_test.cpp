@@ -33,6 +33,10 @@ int main()
     assert(parsedC->body == "# Greetings\n\nHello.\n");
     assert(parsedC->strC() ==
            "< bee@hive.example Bee\n: queen@hive.example, king@hive.example\n@ 2026-08-12T12:00:00Z\n# Greetings\n\nHello.\n");
+    const auto commaBlurb = drfin::Gemmail::parseC(
+        "< bee@hive.example Alice, Senior Engineer\n: queen@hive.example\n@ 2026-08-12T12:00:00Z\nHello.\n");
+    assert(commaBlurb);
+    assert(commaBlurb->sender->blurb == "Alice, Senior Engineer");
     assert(drfin::Gemmail::parseC("\n\n\nHello.\n"));
     assert(!drfin::Gemmail::parseC("< bee@hive.example\n: queen@hive.example\n").has_value());
     assert(!drfin::Gemmail::parseC("< bee@hive.example\n: not-an-address\n@ now\nHi\n").has_value());

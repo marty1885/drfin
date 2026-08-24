@@ -167,8 +167,7 @@ std::expected<Gemmail, std::string> Gemmail::parseC(std::string_view text)
     Gemmail output;
     if (!senders->empty())
     {
-        const auto comma = senders->find(',');
-        const auto sender = parseCAddress(senders->substr(0, comma), true);
+        const auto sender = parseCAddress(*senders, true);
         if (!sender) return std::unexpected("invalid Misfin(C) sender metadata");
         output.sender = *sender;
     }
@@ -176,7 +175,10 @@ std::expected<Gemmail, std::string> Gemmail::parseC(std::string_view text)
     while (recipientOffset < recipients->size())
     {
         const auto comma = recipients->find(',', recipientOffset);
-        const auto recipient = parseCAddress(recipients->substr(recipientOffset, comma - recipientOffset), false);
+        const auto count = comma == std::string_view::npos
+                               ? std::string_view::npos
+                               : comma - recipientOffset;
+        const auto recipient = parseCAddress(recipients->substr(recipientOffset, count), false);
         if (!recipient) return std::unexpected("invalid Misfin(C) recipient metadata");
         output.recipients.push_back(std::move(recipient->address));
         if (comma == std::string_view::npos) break;

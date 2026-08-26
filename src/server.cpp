@@ -48,15 +48,6 @@ void validateIdentity(const Credentials &identity)
         throw std::invalid_argument("Misfin server requires a private key PEM");
 }
 
-std::string certificateBundle(const Credentials &identity)
-{
-    if (identity.privateKeyPem.empty() || identity.privateKeyPem == identity.certificatePem)
-        return identity.certificatePem;
-    if (!identity.certificatePem.empty() && identity.certificatePem.back() != '\n')
-        return identity.certificatePem + "\n" + identity.privateKeyPem;
-    return identity.certificatePem + identity.privateKeyPem;
-}
-
 std::optional<Request> parseBRequest(const std::string &line)
 {
     constexpr std::string_view scheme{"misfin://"};
@@ -176,12 +167,11 @@ class Listener : public std::enable_shared_from_this<Listener>
         // asynchronous TOFU handler decides trust after the handshake.
         auto policy = trantor::TLSPolicy::defaultServerPolicy("", "");
         policy->setServerCertificateProvider(
-            [identityProvider = std::move(identityProvider)](
-                std::string serverName, trantor::ServerCertificateReply reply) {
-                identityProvider(std::move(serverName),
-                                 [reply = std::move(reply)](std::shared_ptr<const Credentials> identity) mutable {
-                    reply(identity ? certificateBundle(*identity) : std::string{});
-                });
+            [identityProvider = std::move(identityProvider)](std::string serverName) {
+                const auto identity = identityProvider(std::move(serverName));
+                if (!identity)
+                    return trantor::ServerCertificate{};
+                return trantor::ServerCertificate{identity->certificatePem, identity->privateKeyPem};
             });
         policy->setPeerCertificateRequest(false)
             .setCertificateVerification(false);
@@ -392,7 +382,7 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
     {
         validateIdentity(identity);
         auto sharedIdentity = std::make_shared<const Credentials>(std::move(identity));
-        listen([sharedIdentity](std::string, ServerIdentityReply reply) { reply(sharedIdentity); },
+        listen([sharedIdentity](std::string) { return sharedIdentity; },
                std::move(tofuHandler), std::move(deliveryHandler),
                std::move(address), port);
     }
@@ -409,10 +399,10 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
             throw std::logic_error("Misfin server is already listening");
         started_ = true;
         const std::weak_ptr<Impl> weak = shared_from_this();
-        drogon::app().registerBeginningAdvice(
+        const auto startListeners =
             [weak,
-              identityProvider = std::move(identityProvider),
-              tofuHandler = std::move(tofuHandler),
+             identityProvider = std::move(identityProvider),
+             tofuHandler = std::move(tofuHandler),
              deliveryHandler = std::move(deliveryHandler),
              address = std::move(address),
              port] {
@@ -439,7 +429,11 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
                         self->listeners_.push_back(std::move(listener));
                     });
                 }
-            });
+            };
+        if (drogon::app().isRunning())
+            startListeners();
+        else
+            drogon::app().registerBeginningAdvice(startListeners);
     }
 
     void stop()

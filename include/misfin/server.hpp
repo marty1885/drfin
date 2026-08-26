@@ -28,11 +28,10 @@ struct IncomingMessage
     std::string serverName;
 };
 
-using ServerIdentityReply = std::function<void(std::shared_ptr<const Credentials>)>;
-// The provider may load a credential asynchronously. It must invoke reply once;
-// nullptr rejects the TLS handshake.
+// Called directly from the TLS handshake. It must only select credentials that
+// are already in memory; nullptr rejects the handshake.
 using ServerIdentityProvider =
-    std::function<void(std::string serverName, ServerIdentityReply reply)>;
+    std::function<std::shared_ptr<const Credentials>(std::string serverName)>;
 
 using TofuDecision = std::function<void(bool accept)>;
 // The status and meta are validated before being sent. For a Misfin(B) 20

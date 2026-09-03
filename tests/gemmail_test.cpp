@@ -81,6 +81,8 @@ int main()
     assert(customPort && customPort->port() == 1960);
     assert(!drfin::parseMisfinRecipient("queen@hive.example/path"));
     assert(!drfin::parseMisfinRecipient("queen @hive.example"));
+    const std::string invalidUtf8Recipient = std::string{"queen"} + '\xff' + "@hive.example";
+    assert(!drfin::parseMisfinRecipient(invalidUtf8Recipient));
 
     const auto gemini = drfin::Url::parse("gemini://example.com:1965/guide?topic=urls#parser");
     assert(gemini);
@@ -96,6 +98,21 @@ int main()
     assert(!drfin::Url::parse("gemini://-example.com/"));
 
     assert(drfin::normalizeFingerprint("AA:bb-01") == "aabb01");
+    const std::string compactFingerprint(64, 'a');
+    std::string colonFingerprint;
+    for (std::size_t index = 0; index < compactFingerprint.size(); index += 2)
+    {
+        if (!colonFingerprint.empty()) colonFingerprint.push_back(':');
+        colonFingerprint.append(compactFingerprint, index, 2);
+    }
+    assert(drfin::isValidSha256Fingerprint(compactFingerprint));
+    assert(drfin::isValidSha256Fingerprint(colonFingerprint));
+    colonFingerprint[2] = '-';
+    assert(drfin::isValidSha256Fingerprint(colonFingerprint));
+    assert(drfin::isValidSha256Fingerprint("  " + compactFingerprint + "  "));
+    assert(!drfin::isValidSha256Fingerprint(compactFingerprint + "\n"));
+    assert(!drfin::isValidSha256Fingerprint(compactFingerprint + "\t"));
+    assert(!drfin::isValidSha256Fingerprint(std::string(64, 'g')));
     assert(drfin::isMisfinResponseStatus(20));
     assert(drfin::isMisfinResponseStatus(69));
     assert(!drfin::isMisfinResponseStatus(19));

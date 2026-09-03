@@ -16,5 +16,6 @@ inline constexpr double kMisfinTransactionTimeout = 60.0;
 
 bool isMisfinResponseStatus(int status) noexcept;
 bool isValidUtf8(std::string_view value) noexcept;
+bool isValidSha256Fingerprint(std::string_view fingerprint) noexcept;
 std::string normalizeFingerprint(std::string_view fingerprint);
 }  // namespace drfin

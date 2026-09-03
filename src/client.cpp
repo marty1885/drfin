@@ -41,11 +41,7 @@ std::expected<Response, std::string> parseResponse(const std::string &line,
         // Misfin(B) returns the recipient mailbox certificate fingerprint, not
         // necessarily the TLS server certificate fingerprint. Hosted mailboxes
         // commonly use a different certificate for each recipient.
-        const auto deliveredTo = normalizeFingerprint(meta);
-        if (deliveredTo.size() != 64 ||
-            std::any_of(deliveredTo.begin(), deliveredTo.end(), [](unsigned char character) {
-                return !std::isxdigit(character);
-            }))
+        if (!isValidSha256Fingerprint(meta))
             return std::unexpected("server sent an invalid recipient certificate fingerprint");
     }
     return Response{status, meta, fingerprint};

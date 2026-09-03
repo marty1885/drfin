@@ -34,6 +34,26 @@ bool isValidUtf8(std::string_view value) noexcept
     return true;
 }
 
+bool isValidSha256Fingerprint(std::string_view fingerprint) noexcept
+{
+    std::size_t hexadecimalDigits = 0;
+    for (const auto value : fingerprint)
+    {
+        const auto character = static_cast<unsigned char>(value);
+        // Fingerprints are ASCII text, but implementations vary in their
+        // choice and placement of visual separators. Reject controls and
+        // non-ASCII bytes while accepting printable punctuation as formatting.
+        if (character < 0x20 || character > 0x7e)
+            return false;
+        if (std::isalnum(character))
+        {
+            if (!std::isxdigit(character)) return false;
+            ++hexadecimalDigits;
+        }
+    }
+    return hexadecimalDigits == 64;
+}
+
 std::string normalizeFingerprint(std::string_view fingerprint)
 {
     std::string normalized;

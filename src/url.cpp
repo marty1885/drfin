@@ -1,4 +1,5 @@
 #include <misfin/url.hpp>
+#include <misfin/utils.hpp>
 
 #include <charconv>
 #include <cctype>
@@ -176,6 +177,8 @@ std::string Url::str() const
 
 std::optional<Url> parseMisfinRecipient(std::string_view recipient)
 {
+    if (!isValidUtf8(recipient))
+        return std::nullopt;
     const auto url = recipient.starts_with("misfin://")
                          ? Url::parse(recipient)
                          : Url::parse("misfin://" + std::string{recipient});

@@ -1,4 +1,5 @@
 #include <misfin/client.hpp>
+#include <misfin/gemmail.hpp>
 #include <misfin/url.hpp>
 #include <misfin/utils.hpp>
 
@@ -36,12 +37,16 @@ std::expected<Response, std::string> parseResponse(const std::string &line,
     if (error != std::errc{} || end != line.data() + 2 || !isMisfinResponseStatus(status))
         return std::unexpected("server sent an invalid Misfin response");
     const auto meta = line.substr(3);
-    if (status == 20 && version == MisfinVersion::B)
+    if (status == 20)
     {
-        // Misfin(B) returns the recipient mailbox certificate fingerprint, not
-        // necessarily the TLS server certificate fingerprint. Hosted mailboxes
-        // commonly use a different certificate for each recipient.
-        if (!isValidSha256Fingerprint(meta))
+        // Success returns the recipient mailbox certificate fingerprint, not
+        // necessarily the TLS server certificate fingerprint. C additionally
+        // requires the canonical lower-case, delimiter-free representation.
+        if (!isValidSha256Fingerprint(meta) ||
+            (version == MisfinVersion::C &&
+             (meta.size() != 64 || std::ranges::any_of(meta, [](unsigned char character) {
+                  return !std::isdigit(character) && !(character >= 'a' && character <= 'f');
+              }))))
             return std::unexpected("server sent an invalid recipient certificate fingerprint");
     }
     return Response{status, meta, fingerprint};
@@ -88,8 +93,10 @@ class Operation : public std::enable_shared_from_this<Operation>
         const auto recipient = parseMisfinRecipient(request_.recipient);
         if (!recipient)
             return finish(std::unexpected("recipient must be mailbox@hostname or misfin://mailbox@hostname"));
-        if (request_.message.find('\r') != std::string::npos)
-            return finish(std::unexpected("message must not contain CR; use LF line endings"));
+        for (std::size_t index = 0; index < request_.message.size(); ++index)
+            if (request_.message[index] == '\r' &&
+                (index + 1 == request_.message.size() || request_.message[index + 1] != '\n'))
+                return finish(std::unexpected("message contains a bare CR"));
         if (!isValidUtf8(request_.message))
             return finish(std::unexpected("message must be valid UTF-8"));
 
@@ -101,12 +108,16 @@ class Operation : public std::enable_shared_from_this<Operation>
         version_ = version;
         if (version == MisfinVersion::B)
         {
+            if (request_.message.find('\r') != std::string::npos)
+                return finish(std::unexpected("Misfin(B) message must not contain CR"));
             if (bRequest.size() > kMaxMisfinRequestSize)
                 return finish(std::unexpected("Misfin(B) request exceeds 2048 bytes"));
             requestBytes_ = bRequest;
         }
         else
         {
+            if (!Gemmail::parseC(request_.message))
+                return finish(std::unexpected("invalid Misfin(C) message"));
             if (request_.message.size() > kMaxMisfinCContentSize)
                 return finish(std::unexpected("Misfin(C) content exceeds 16384 bytes"));
             const auto header = "misfin://" + recipient_ + "\t" + std::to_string(request_.message.size()) + "\r\n";

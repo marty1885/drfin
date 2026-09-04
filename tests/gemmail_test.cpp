@@ -24,22 +24,40 @@ int main()
     assert(parsed->subject() == "Greetings");
     assert(parsed->str() ==
            "< bee@hive.example Bee\n: queen@hive.example\n@ 2026-08-12T12:00:00Z\n# Greetings\n\nHello.\n");
+    const auto forwardedB = drfin::Gemmail::parse(
+        "< list@hive.example Workers list\n< bee@hive.example Bee\n"
+        ": queen@hive.example\n@ 2026-08-12T12:00:00Z\n# News\n");
+    assert(forwardedB);
+    assert(forwardedB->sender->address == "list@hive.example");
+    assert(forwardedB->recipients == std::vector<std::string>{"queen@hive.example"});
+    assert(forwardedB->timestamp == "2026-08-12T12:00:00Z");
+    assert(forwardedB->body == "< bee@hive.example Bee\n# News\n");
+    assert(forwardedB->str() ==
+           "< list@hive.example Workers list\n: queen@hive.example\n"
+           "@ 2026-08-12T12:00:00Z\n< bee@hive.example Bee\n# News\n");
     const auto parsedC = drfin::Gemmail::parseC(
-        "< bee@hive.example Bee\n: queen@hive.example, king@hive.example\n@ 2026-08-12T12:00:00Z\n# Greetings\n\nHello.\n");
+        "bee@hive.example Bee, wasp@hive.example Wasp\n"
+        "queen@hive.example, king@hive.example Royal\n"
+        "2026-08-12T12:00:00Z, 2026-08-11T11:00:00Z\n# Greetings\n\nHello.\n");
     assert(parsedC);
     assert(parsedC->sender->address == "bee@hive.example");
     assert(parsedC->recipients == std::vector<std::string>{"queen@hive.example", "king@hive.example"});
     assert(parsedC->timestamp == "2026-08-12T12:00:00Z");
     assert(parsedC->body == "# Greetings\n\nHello.\n");
     assert(parsedC->strC() ==
-           "< bee@hive.example Bee\n: queen@hive.example, king@hive.example\n@ 2026-08-12T12:00:00Z\n# Greetings\n\nHello.\n");
-    const auto commaBlurb = drfin::Gemmail::parseC(
-        "< bee@hive.example Alice, Senior Engineer\n: queen@hive.example\n@ 2026-08-12T12:00:00Z\nHello.\n");
-    assert(commaBlurb);
-    assert(commaBlurb->sender->blurb == "Alice, Senior Engineer");
+           "bee@hive.example Bee\nqueen@hive.example, king@hive.example\n"
+           "2026-08-12T12:00:00Z\n# Greetings\n\nHello.\n");
     assert(drfin::Gemmail::parseC("\n\n\nHello.\n"));
-    assert(!drfin::Gemmail::parseC("< bee@hive.example\n: queen@hive.example\n").has_value());
-    assert(!drfin::Gemmail::parseC("< bee@hive.example\n: not-an-address\n@ now\nHi\n").has_value());
+    assert(drfin::Gemmail::parseC(
+        "bee@hive.example Bee\r\nqueen@hive.example\r\n2026-08-12T12:00:00Z\r\nHi\r\n"));
+    assert(!drfin::Gemmail::parseC("bee@hive.example\nqueen@hive.example\n").has_value());
+    assert(!drfin::Gemmail::parseC("bee@hive.example\nnot-an-address\nnow\nHi\n").has_value());
+    assert(!drfin::Gemmail::parseC("bee@hive.example Alice, Senior Engineer\n\n\n").has_value());
+    assert(!drfin::Gemmail::parseC("bee@hive.example user@example\n\n\n").has_value());
+    assert(!drfin::Gemmail::parseC("bee@hive.example\n\n2026-02-29T12:00:00Z\n").has_value());
+    assert(!drfin::Gemmail::parseC("bee@hive.example\rbroken\n\n\n").has_value());
+    assert(!drfin::Gemmail::parseC("\n\n\nunterminated").has_value());
+    assert(!drfin::Gemmail::parseC(std::string(1024, 'a') + "\n\n\n").has_value());
     assert(drfin::Gemmail{.body = "### Three\n"}.subject() == "Three");
     assert(!drfin::Gemmail{.body = "#### Four\n"}.subject());
     assert(!drfin::Gemmail{.body = "###"}.subject());
@@ -54,7 +72,8 @@ int main()
     assert(unsafeMetadata.str() ==
            "< bee@hive.example Bee Injected\n: queen@hive.example  @ injected\n@ now < injected\n");
     assert(unsafeMetadata.strC() ==
-           "< bee@hive.example Bee Injected\n: queen@hive.example  @ injected\n@ now < injected\n");
+           "bee@hive.example Bee Injected\nqueen@hive.example  @ injected\nnow < injected\n");
+    assert(drfin::Gemmail{.body = "unterminated"}.strC() == "\n\n\nunterminated\n");
     assert(!drfin::Gemmail::parse("< not-an-address\n").has_value());
     assert(!drfin::Gemmail::parse(": not-an-address\n").has_value());
     assert(drfin::Gemmail::parse("< bee@hive.example:1958\n").has_value());

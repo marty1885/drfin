@@ -34,8 +34,9 @@ using ServerIdentityProvider =
     std::function<std::shared_ptr<const Credentials>(std::string serverName)>;
 
 using TofuDecision = std::function<void(bool accept)>;
-// The status and meta are validated before being sent. For a Misfin(B) 20
-// response, meta is the recipient mailbox certificate fingerprint.
+// The status and meta are validated before being sent. For every 20 response,
+// meta must be the recipient mailbox certificate fingerprint; the TLS server
+// certificate is not necessarily the recipient identity.
 using DeliveryDecision = std::function<void(int status, std::string meta)>;
 
 // Both handlers may save their decision callback and invoke it asynchronously.

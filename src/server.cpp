@@ -1,4 +1,5 @@
 #include <misfin/server.hpp>
+#include <misfin/gemmail.hpp>
 #include <misfin/url.hpp>
 #include <misfin/utils.hpp>
 
@@ -24,19 +25,6 @@ namespace drfin
 {
 namespace
 {
-std::string certificateFingerprint(const trantor::CertificatePtr &certificate)
-{
-    if (!certificate)
-    {
-        LOG_ERROR << "Misfin server has no local TLS certificate";
-        return {};
-    }
-    const auto fingerprint = normalizeFingerprint(certificate->sha256Fingerprint());
-    if (fingerprint.empty())
-        LOG_ERROR << "Misfin server certificate has no SHA-256 fingerprint";
-    return fingerprint;
-}
-
 void validateIdentity(const Credentials &identity)
 {
     if (!trantor::Certificate::fromPem(identity.certificatePem))
@@ -90,7 +78,6 @@ std::optional<CHeader> parseCHeader(const std::string &line)
 struct ConnectionState
 {
     std::weak_ptr<trantor::TcpConnection> connection;
-    std::string fingerprint;
     std::string serverName;
     bool processing = false;
     bool replied = false;
@@ -117,9 +104,21 @@ void reply(const std::shared_ptr<ConnectionState> &state,
     if (state->replied)
         return;
     std::string responseMeta = meta;
-    if (status == 20 && state->version == MisfinVersion::B && responseMeta.empty())
-        responseMeta = state->fingerprint;
-    if (!isMisfinResponseStatus(status) || responseMeta.find_first_of("\r\n") != std::string::npos)
+    bool invalidSuccessFingerprint = false;
+    if (status == 20 && state->version == MisfinVersion::B)
+    {
+        invalidSuccessFingerprint = !isValidSha256Fingerprint(responseMeta);
+        if (!invalidSuccessFingerprint) responseMeta = normalizeFingerprint(responseMeta);
+    }
+    else if (status == 20)
+    {
+        invalidSuccessFingerprint = responseMeta.size() != 64 ||
+            std::ranges::any_of(responseMeta, [](unsigned char character) {
+                return !std::isdigit(character) && !(character >= 'a' && character <= 'f');
+            });
+    }
+    if (!isMisfinResponseStatus(status) || responseMeta.find_first_of("\r\n") != std::string::npos ||
+        invalidSuccessFingerprint)
     {
         LOG_ERROR << "Misfin server attempted an invalid response";
         status = 50;
@@ -237,8 +236,15 @@ class Listener : public std::enable_shared_from_this<Listener>
                 return;
             std::string content{buffer->peek(), state->cHeader->contentSize};
             buffer->retrieve(state->cHeader->contentSize);
-            if (content.find('\r') != std::string::npos || !isValidUtf8(content))
+            bool bareCr = false;
+            for (std::size_t index = 0; index < content.size(); ++index)
+                if (content[index] == '\r' &&
+                    (index + 1 == content.size() || content[index + 1] != '\n'))
+                    bareCr = true;
+            if (bareCr || !isValidUtf8(content))
                 return reply(state, 59, "invalid Misfin(C) content");
+            if (!Gemmail::parseC(content))
+                return reply(state, 59, "malformed Misfin(C) message");
             request = Request{std::move(state->cHeader->recipient), std::move(content), MisfinVersion::C};
             state->cHeader.reset();
         }
@@ -256,7 +262,7 @@ class Listener : public std::enable_shared_from_this<Listener>
             const auto separator = line.find_first_of(" \t", scheme.size());
             if (separator != std::string::npos && line[separator] == '\t')
             {
-                if (line.size() > kMaxMisfinCHeaderSize)
+                if (line.size() + 2 > kMaxMisfinCHeaderSize)
                     return reply(state, 59, "Misfin(C) header exceeds 1024 bytes");
                 const auto header = parseCHeader(line);
                 if (!header)
@@ -280,9 +286,6 @@ class Listener : public std::enable_shared_from_this<Listener>
         const auto peer = connection->peerCertificate();
         if (!peer)
             return reply(state, 60, "certificate required");
-        state->fingerprint = certificateFingerprint(connection->localCertificate());
-        if (state->fingerprint.empty())
-            return reply(state, 50, "internal server error");
         state->serverName = connection->sniName();
         state->version = *request->version;
 

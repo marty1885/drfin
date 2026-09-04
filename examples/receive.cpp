@@ -33,19 +33,23 @@ int main(int argc, char **argv)
     try
     {
         const auto threadCount = std::max(1u, std::thread::hardware_concurrency());
+        drfin::Credentials identity{readFile(argv[1]), readFile(argv[2])};
+        const auto certificate = trantor::Certificate::fromPem(identity.certificatePem);
+        if (!certificate) throw std::runtime_error("failed to parse recipient certificate");
+        const auto recipientFingerprint = drfin::normalizeFingerprint(certificate->sha256Fingerprint());
         drfin::Server server;
         server.listen(
-            {readFile(argv[1]), readFile(argv[2])},
+            std::move(identity),
             [](drfin::TrustRequest request, drfin::TofuDecision decide) {
                 std::cout << "TOFU " << request.sender->sha256Fingerprint()
                           << " for " << request.recipient << "\n";
                 decide(true);
             },
-            [](drfin::IncomingMessage message, drfin::DeliveryDecision decide) {
+            [recipientFingerprint](drfin::IncomingMessage message, drfin::DeliveryDecision decide) {
                 std::cout << "from " << message.sender->sha256Fingerprint() << " to "
                           << message.request.recipient << ": " << message.request.message << "\n";
                 if (message.request.recipient == "queen@127.0.0.1")
-                    decide(20, {});
+                    decide(20, recipientFingerprint);
                 else
                     decide(51, "mailbox does not exist");
             },

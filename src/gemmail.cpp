@@ -4,6 +4,7 @@
 #include <array>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 
 namespace drfin
 {
@@ -54,20 +55,52 @@ std::optional<std::vector<std::string>> parseRecipients(std::string_view line)
 std::optional<GemmailAddress> parseCAddress(std::string_view value, bool allowBlurb)
 {
     value = trim(value);
-    const auto space = value.find_first_of(" \t");
+    if (value.find('\t') != std::string_view::npos) return std::nullopt;
+    const auto space = value.find(' ');
     const auto address = value.substr(0, space);
     if (!parseMisfinRecipient(address)) return std::nullopt;
-    return GemmailAddress{std::string{address}, allowBlurb && space != std::string_view::npos
-                                                    ? std::string{trim(value.substr(space + 1))}
-                                                    : std::string{}};
+    if (space == std::string_view::npos) return GemmailAddress{std::string{address}, {}};
+    if (!allowBlurb || space + 1 == value.size() || value[space + 1] == ' ') return std::nullopt;
+    const auto blurb = value.substr(space + 1);
+    if (blurb.find_first_of(",@") != std::string_view::npos) return std::nullopt;
+    return GemmailAddress{std::string{address}, std::string{blurb}};
 }
 
-std::optional<std::string_view> cMetadata(std::string_view line, char marker)
+bool isIso8601Utc(std::string_view value)
 {
-    line = trim(line);
-    if (line.empty()) return line;
-    if (line.front() != marker) return std::nullopt;
-    return trim(line.substr(1));
+    int year, month, day, hour, minute, second;
+    char trailing;
+    const std::string text{value};
+    if (text.size() != 20) return false;
+    if (std::sscanf(text.c_str(), "%4d-%2d-%2dT%2d:%2d:%2dZ%c",
+                    &year, &month, &day, &hour, &minute, &second, &trailing) != 6)
+        return false;
+    if (month < 1 || month > 12 || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+        second < 0 || second > 60)
+        return false;
+    static constexpr std::array days{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    const bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    const int maximumDay = days[static_cast<std::size_t>(month - 1)] + (month == 2 && leap ? 1 : 0);
+    return day >= 1 && day <= maximumDay;
+}
+
+std::vector<std::string_view> splitCMetadata(std::string_view line)
+{
+    std::vector<std::string_view> items;
+    if (line.empty()) return items;
+    std::size_t offset = 0;
+    while (offset <= line.size())
+    {
+        const auto comma = line.find(',', offset);
+        const auto item = trim(line.substr(offset, comma == std::string_view::npos
+                                                       ? std::string_view::npos
+                                                       : comma - offset));
+        if (item.empty()) return {};
+        items.push_back(item);
+        if (comma == std::string_view::npos) break;
+        offset = comma + 1;
+    }
+    return items;
 }
 
 bool isHeading(std::string_view line)
@@ -97,13 +130,12 @@ std::expected<Gemmail, std::string> Gemmail::parse(std::string_view text)
     Gemmail message;
     std::string body;
     size_t start = 0;
-    bool metadataSection = true;
     while (start <= text.size())
     {
         const auto end = text.find('\n', start);
         const auto line = text.substr(start, end == std::string_view::npos ? end : end - start);
         bool metadata = false;
-        if (metadataSection && !message.sender && line.starts_with('<'))
+        if (!message.sender && line.starts_with('<'))
         {
             const auto sender = parseSender(line);
             if (!sender)
@@ -111,7 +143,7 @@ std::expected<Gemmail, std::string> Gemmail::parse(std::string_view text)
             message.sender = *sender;
             metadata = true;
         }
-        else if (metadataSection && message.recipients.empty() && line.starts_with(':'))
+        else if (message.recipients.empty() && line.starts_with(':'))
         {
             const auto recipients = parseRecipients(line);
             if (!recipients || recipients->empty())
@@ -119,7 +151,7 @@ std::expected<Gemmail, std::string> Gemmail::parse(std::string_view text)
             message.recipients = *recipients;
             metadata = true;
         }
-        else if (metadataSection && !message.timestamp && line.starts_with('@'))
+        else if (!message.timestamp && line.starts_with('@'))
         {
             if (line.size() == 1 || !std::isspace(static_cast<unsigned char>(line[1])))
                 return std::unexpected("invalid Gemmail timestamp line");
@@ -131,7 +163,6 @@ std::expected<Gemmail, std::string> Gemmail::parse(std::string_view text)
         }
         if (!metadata)
         {
-            metadataSection = false;
             body.append(line);
             if (end != std::string_view::npos)
                 body.push_back('\n');
@@ -146,8 +177,31 @@ std::expected<Gemmail, std::string> Gemmail::parse(std::string_view text)
 
 std::expected<Gemmail, std::string> Gemmail::parseC(std::string_view text)
 {
-    if (text.find('\r') != std::string_view::npos)
-        return std::unexpected("Gemmail must use LF line endings");
+    if (text.empty() || text.back() != '\n')
+        return std::unexpected("Misfin(C) message must end with a line terminator");
+    std::size_t rawLineStart = 0;
+    for (std::size_t line = 0; line < 3; ++line)
+    {
+        const auto end = text.find('\n', rawLineStart);
+        if (end == std::string_view::npos)
+            return std::unexpected("Misfin(C) message is missing metadata lines");
+        if (end - rawLineStart + 1 > 1024)
+            return std::unexpected("Misfin(C) metadata line exceeds 1024 bytes");
+        rawLineStart = end + 1;
+    }
+    std::string normalized;
+    normalized.reserve(text.size());
+    for (std::size_t index = 0; index < text.size(); ++index)
+    {
+        if (text[index] == '\r')
+        {
+            if (index + 1 >= text.size() || text[index + 1] != '\n')
+                return std::unexpected("Misfin(C) message contains a bare CR");
+            continue;
+        }
+        normalized.push_back(text[index]);
+    }
+    text = normalized;
     std::array<std::string_view, 3> lines;
     std::size_t offset = 0;
     for (auto &line : lines)
@@ -158,38 +212,30 @@ std::expected<Gemmail, std::string> Gemmail::parseC(std::string_view text)
         line = text.substr(offset, end - offset);
         offset = end + 1;
     }
-    const auto senders = cMetadata(lines[0], '<');
-    const auto recipients = cMetadata(lines[1], ':');
-    const auto timestamps = cMetadata(lines[2], '@');
-    if (!senders || !recipients || !timestamps)
-        return std::unexpected("invalid Misfin(C) metadata line");
+    const auto senders = splitCMetadata(lines[0]);
+    const auto recipients = splitCMetadata(lines[1]);
+    const auto timestamps = splitCMetadata(lines[2]);
+    if ((!lines[0].empty() && senders.empty()) || (!lines[1].empty() && recipients.empty()) ||
+        (!lines[2].empty() && timestamps.empty()))
+        return std::unexpected("invalid Misfin(C) metadata list");
 
     Gemmail output;
-    if (!senders->empty())
+    for (const auto item : senders)
     {
-        const auto sender = parseCAddress(*senders, true);
+        const auto sender = parseCAddress(item, true);
         if (!sender) return std::unexpected("invalid Misfin(C) sender metadata");
-        output.sender = *sender;
+        if (!output.sender) output.sender = *sender;
     }
-    std::size_t recipientOffset = 0;
-    while (recipientOffset < recipients->size())
+    for (const auto item : recipients)
     {
-        const auto comma = recipients->find(',', recipientOffset);
-        const auto count = comma == std::string_view::npos
-                               ? std::string_view::npos
-                               : comma - recipientOffset;
-        const auto recipient = parseCAddress(recipients->substr(recipientOffset, count), false);
+        const auto recipient = parseCAddress(item, true);
         if (!recipient) return std::unexpected("invalid Misfin(C) recipient metadata");
         output.recipients.push_back(std::move(recipient->address));
-        if (comma == std::string_view::npos) break;
-        recipientOffset = comma + 1;
     }
-    if (!timestamps->empty())
+    for (const auto item : timestamps)
     {
-        const auto comma = timestamps->find(',');
-        const auto timestamp = trim(timestamps->substr(0, comma));
-        if (timestamp.empty()) return std::unexpected("invalid Misfin(C) timestamp metadata");
-        output.timestamp = std::string{timestamp};
+        if (!isIso8601Utc(item)) return std::unexpected("invalid Misfin(C) timestamp metadata");
+        if (!output.timestamp) output.timestamp = std::string{item};
     }
     output.body = std::string{text.substr(offset)};
     return output;
@@ -226,13 +272,13 @@ std::string Gemmail::strC() const
     std::string text;
     if (sender)
     {
-        text += "< " + sanitizeMetadata(sender->address);
-        if (!sender->blurb.empty()) text += " " + sanitizeMetadata(sender->blurb);
+        text += sanitizeMetadata(sender->address);
+        if (!sender->blurb.empty() && sender->blurb.find_first_of(",@") == std::string::npos)
+            text += " " + sanitizeMetadata(sender->blurb);
     }
     text += '\n';
     if (!recipients.empty())
     {
-        text += ": ";
         for (size_t index = 0; index < recipients.size(); ++index)
         {
             if (index != 0) text += ", ";
@@ -240,9 +286,11 @@ std::string Gemmail::strC() const
         }
     }
     text += '\n';
-    if (timestamp) text += "@ " + sanitizeMetadata(*timestamp);
+    if (timestamp) text += sanitizeMetadata(*timestamp);
     text += '\n';
-    return text + body;
+    text += body;
+    if (!text.ends_with('\n')) text.push_back('\n');
+    return text;
 }
 
 std::optional<std::string> Gemmail::subject() const

@@ -30,8 +30,8 @@ struct Gemmail
 
     // Produces canonical Gemmail: metadata first, followed by the body.
     std::string str() const;
-    // Produces the Misfin(C) form with exactly three metadata lines. C uses
-    // comma-separated recipient metadata rather than B's whitespace list.
+    // Produces the Misfin(C) form with exactly three unprefixed metadata lines.
+    // C uses comma-separated lists rather than B's marker-prefixed lines.
     std::string strC() const;
 
     // Returns the first Gemtext heading from the message body, if present.

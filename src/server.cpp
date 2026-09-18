@@ -78,11 +78,61 @@ std::optional<CHeader> parseCHeader(const std::string &line)
 struct ConnectionState
 {
     std::weak_ptr<trantor::TcpConnection> connection;
+    std::shared_ptr<class ConnectionPermit> permit;
     std::string serverName;
     bool processing = false;
     bool replied = false;
     std::optional<CHeader> cHeader;
     MisfinVersion version = MisfinVersion::B;
+};
+
+class ConnectionLimiter final
+{
+  public:
+    explicit ConnectionLimiter(const std::size_t maximum) : maximum_(maximum)
+    {
+        if (maximum_ == 0)
+            throw std::invalid_argument("Misfin server connection limit must be positive");
+    }
+
+    [[nodiscard]] bool tryAcquire() noexcept
+    {
+        auto current = active_.load(std::memory_order_relaxed);
+        while (current < maximum_)
+            if (active_.compare_exchange_weak(current, current + 1,
+                                              std::memory_order_acquire,
+                                              std::memory_order_relaxed))
+                return true;
+        return false;
+    }
+
+    void release() noexcept
+    {
+        active_.fetch_sub(1, std::memory_order_release);
+    }
+
+  private:
+    const std::size_t maximum_;
+    std::atomic_size_t active_{0};
+};
+
+class ConnectionPermit final
+{
+  public:
+    explicit ConnectionPermit(std::shared_ptr<ConnectionLimiter> limiter) noexcept
+        : limiter_(std::move(limiter)) {}
+
+    ~ConnectionPermit()
+    {
+        if (limiter_)
+            limiter_->release();
+    }
+
+    ConnectionPermit(const ConnectionPermit &) = delete;
+    ConnectionPermit &operator=(const ConnectionPermit &) = delete;
+
+  private:
+    std::shared_ptr<ConnectionLimiter> limiter_;
 };
 
 using DecisionOnce = std::shared_ptr<std::atomic_bool>;
@@ -148,9 +198,11 @@ class Listener : public std::enable_shared_from_this<Listener>
   public:
     Listener(trantor::EventLoop &loop,
              TofuHandler tofuHandler,
-             DeliveryHandler deliveryHandler)
+             DeliveryHandler deliveryHandler,
+             std::shared_ptr<ConnectionLimiter> connectionLimiter)
         : loop_(loop), tofuHandler_(std::move(tofuHandler)),
-          deliveryHandler_(std::move(deliveryHandler))
+          deliveryHandler_(std::move(deliveryHandler)),
+          connectionLimiter_(std::move(connectionLimiter))
     {
     }
 
@@ -176,6 +228,26 @@ class Listener : public std::enable_shared_from_this<Listener>
             .setCertificateVerification(false);
         server_->enableSSL(std::move(policy));
         const std::weak_ptr<Listener> weak = shared_from_this();
+        server_->setConnectionCallback([weak](const auto &connection) {
+            const auto self = weak.lock();
+            if (!self)
+                return;
+            if (!connection->connected())
+            {
+                if (const auto state = connection->template getContext<ConnectionState>())
+                    state->permit.reset();
+                return;
+            }
+            if (!self->connectionLimiter_->tryAcquire())
+            {
+                connection->forceClose();
+                return;
+            }
+            auto state = std::make_shared<ConnectionState>();
+            state->connection = connection;
+            state->permit = std::make_shared<ConnectionPermit>(self->connectionLimiter_);
+            connection->setContext(std::move(state));
+        });
         server_->setRecvMessageCallback([weak](const auto &connection, auto *buffer) {
             if (const auto self = weak.lock())
                 self->receive(connection, buffer);
@@ -372,6 +444,7 @@ class Listener : public std::enable_shared_from_this<Listener>
     std::unique_ptr<trantor::TcpServer> server_;
     TofuHandler tofuHandler_;
     DeliveryHandler deliveryHandler_;
+    std::shared_ptr<ConnectionLimiter> connectionLimiter_;
 };
 
 class Server::Impl : public std::enable_shared_from_this<Server::Impl>
@@ -381,25 +454,28 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
                 TofuHandler tofuHandler,
                 DeliveryHandler deliveryHandler,
                 std::string address,
-                unsigned short port)
+                unsigned short port,
+                std::size_t maxConnections)
     {
         validateIdentity(identity);
         auto sharedIdentity = std::make_shared<const Credentials>(std::move(identity));
         listen([sharedIdentity](std::string) { return sharedIdentity; },
                std::move(tofuHandler), std::move(deliveryHandler),
-               std::move(address), port);
+               std::move(address), port, maxConnections);
     }
 
     void listen(ServerIdentityProvider identityProvider,
                 TofuHandler tofuHandler,
                 DeliveryHandler deliveryHandler,
                 std::string address,
-                unsigned short port)
+                unsigned short port,
+                std::size_t maxConnections)
     {
         if (!identityProvider)
             throw std::invalid_argument("Misfin server requires an identity provider");
         if (started_)
             throw std::logic_error("Misfin server is already listening");
+        auto connectionLimiter = std::make_shared<ConnectionLimiter>(maxConnections);
         started_ = true;
         const std::weak_ptr<Impl> weak = shared_from_this();
         const auto startListeners =
@@ -408,7 +484,8 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
              tofuHandler = std::move(tofuHandler),
              deliveryHandler = std::move(deliveryHandler),
              address = std::move(address),
-             port] {
+             port,
+             connectionLimiter = std::move(connectionLimiter)] {
                 const auto self = weak.lock();
                 if (!self || self->stopped_.load(std::memory_order_relaxed))
                     return;
@@ -421,12 +498,13 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
                                        tofuHandler,
                                        deliveryHandler,
                                        address,
-                                       port] {
+                                       port,
+                                       connectionLimiter] {
                         const auto self = weak.lock();
                         if (!self || self->stopped_.load(std::memory_order_relaxed))
                             return;
                         auto listener = std::make_shared<Listener>(
-                            *loop, tofuHandler, deliveryHandler);
+                            *loop, tofuHandler, deliveryHandler, connectionLimiter);
                         listener->listen(identityProvider, address, port);
                         std::lock_guard<std::mutex> lock{self->mutex_};
                         self->listeners_.push_back(std::move(listener));
@@ -465,21 +543,23 @@ void Server::listen(Credentials identity,
                      TofuHandler tofuHandler,
                      DeliveryHandler deliveryHandler,
                      std::string address,
-                     unsigned short port)
+                     unsigned short port,
+                     const std::size_t maxConnections)
 {
     impl_->listen(std::move(identity), std::move(tofuHandler), std::move(deliveryHandler),
-                    std::move(address), port);
+                    std::move(address), port, maxConnections);
 }
 
 void Server::listen(ServerIdentityProvider identityProvider,
                     TofuHandler tofuHandler,
                     DeliveryHandler deliveryHandler,
                     std::string address,
-                    unsigned short port)
+                    unsigned short port,
+                    const std::size_t maxConnections)
 {
     impl_->listen(std::move(identityProvider),
                   std::move(tofuHandler), std::move(deliveryHandler),
-                  std::move(address), port);
+                  std::move(address), port, maxConnections);
 }
 
 void Server::stop()

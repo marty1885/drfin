@@ -6,6 +6,7 @@
 #include <trantor/net/Certificate.h>
 
 #include <functional>
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -58,14 +59,16 @@ class Server
                 TofuHandler tofuHandler,
                 DeliveryHandler deliveryHandler,
                 std::string address = "0.0.0.0",
-                unsigned short port = kMisfinPort);
+                unsigned short port = kMisfinPort,
+                std::size_t maxConnections = 256);
     // The provider runs synchronously during the TLS handshake and may be
     // called concurrently. Return nullptr to reject the handshake.
     void listen(ServerIdentityProvider identityProvider,
                 TofuHandler tofuHandler,
                 DeliveryHandler deliveryHandler,
                 std::string address = "0.0.0.0",
-                unsigned short port = kMisfinPort);
+                unsigned short port = kMisfinPort,
+                std::size_t maxConnections = 256);
     void stop();
 
   private:

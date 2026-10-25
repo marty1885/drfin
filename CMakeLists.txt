@@ -9,7 +9,7 @@ option(DRFIN_BUILD_EXAMPLES ON)
 
 find_package(Drogon CONFIG REQUIRED)
 
-add_library(misfin src/client.cpp src/gemmail.cpp src/server.cpp src/url.cpp src/utils.cpp)
+add_library(misfin src/client.cpp src/gemmail.cpp src/layout_jitter.cpp src/server.cpp src/url.cpp src/utils.cpp)
 target_include_directories(misfin PUBLIC include)
 target_link_libraries(misfin PUBLIC Drogon::Drogon)
 target_compile_options(misfin PRIVATE -Wall -Wextra -Wpedantic -Werror)

@@ -2,6 +2,7 @@
 #include <misfin/gemmail.hpp>
 #include <misfin/url.hpp>
 #include <misfin/utils.hpp>
+#include "layout_jitter.hpp"
 
 #include <drogon/drogon.h>
 
@@ -266,11 +267,12 @@ class Listener : public std::enable_shared_from_this<Listener>
             stopInLoop();
             return;
         }
-        const std::weak_ptr<Listener> weak = shared_from_this();
-        loop_.runInLoop([weak] {
-            if (const auto self = weak.lock())
-                self->stopInLoop();
-        });
+        // Keep the listener, and therefore its TcpServer, alive until teardown
+        // runs on the event loop that owns it. A weak capture allows the last
+        // external reference to disappear immediately after this method
+        // returns, destroying an active TcpServer on the caller's thread.
+        const auto self = shared_from_this();
+        loop_.runInLoop([self] { self->stopInLoop(); });
     }
 
   private:
@@ -285,6 +287,11 @@ class Listener : public std::enable_shared_from_this<Listener>
     void receive(const trantor::TcpConnectionPtr &connection,
                  trantor::MsgBuffer *buffer)
     {
+        const LayoutJitter layoutJitter;
+        auto *stackJitter = static_cast<volatile unsigned char *>(
+            __builtin_alloca(layoutJitter.stackBytes()));
+        layoutJitter.touchStack(stackJitter, layoutJitter.stackBytes());
+
         auto state = connection->getContext<ConnectionState>();
         if (!state)
         {
@@ -506,8 +513,21 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
                         auto listener = std::make_shared<Listener>(
                             *loop, tofuHandler, deliveryHandler, connectionLimiter);
                         listener->listen(identityProvider, address, port);
-                        std::lock_guard<std::mutex> lock{self->mutex_};
-                        self->listeners_.push_back(std::move(listener));
+                        {
+                            std::lock_guard<std::mutex> lock{self->mutex_};
+                            // stop() sets stopped_ before taking this mutex. A
+                            // listener whose construction raced that transition
+                            // must not be published after stop() has already
+                            // drained the collection.
+                            if (!self->stopped_.load(std::memory_order_relaxed))
+                            {
+                                self->listeners_.push_back(std::move(listener));
+                                return;
+                            }
+                        }
+                        // This callback runs on the listener's owning loop, so
+                        // teardown is immediate and thread-correct.
+                        listener->stop();
                     });
                 }
             };
@@ -537,7 +557,10 @@ class Server::Impl : public std::enable_shared_from_this<Server::Impl>
 };
 
 Server::Server() : impl_(std::make_shared<Impl>()) {}
-Server::~Server() = default;
+Server::~Server()
+{
+    impl_->stop();
+}
 
 void Server::listen(Credentials identity,
                      TofuHandler tofuHandler,

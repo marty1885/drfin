@@ -1,4 +1,5 @@
 #include <misfin/client.hpp>
+#include "layout_jitter.hpp"
 #include <misfin/gemmail.hpp>
 #include <misfin/url.hpp>
 #include <misfin/utils.hpp>
@@ -310,6 +311,11 @@ class Operation : public std::enable_shared_from_this<Operation>
             }
         });
         client->setMessageCallback([weak](const auto &connection, auto *buffer) {
+            const LayoutJitter layoutJitter;
+            auto *stackJitter = static_cast<volatile unsigned char *>(
+                __builtin_alloca(layoutJitter.stackBytes()));
+            layoutJitter.touchStack(stackJitter, layoutJitter.stackBytes());
+
             const auto self = weak.lock();
             if (!self)
                 return;

@@ -383,7 +383,7 @@ class Listener : public std::enable_shared_from_this<Listener>
             tofuHandler_(
                 {peer, std::move(recipient), state->serverName},
                 [weak, tofuDecision, state, request = std::move(incomingRequest), peer = std::move(deliveryPeer)](
-                    bool accepted) mutable {
+                    TofuVerdict verdict) mutable {
                 const auto self = weak.lock();
             if (!self || !claimDecision(tofuDecision))
                 return;
@@ -391,7 +391,7 @@ class Listener : public std::enable_shared_from_this<Listener>
                                      state,
                                      request = std::move(request),
                                      peer = std::move(peer),
-                                     accepted] {
+                                     verdict = std::move(verdict)] {
                 const auto self = weak.lock();
                 if (!self)
                     return;
@@ -400,8 +400,13 @@ class Listener : public std::enable_shared_from_this<Listener>
                 // Do not start delivery after that rejection.
                 if (!state->processing)
                     return;
-                if (!accepted)
+                if (!verdict.accepted)
+                {
+                    // Only a temporary failure may replace the permanent decline.
+                    if (verdict.status / 10 == 4)
+                        return reply(state, verdict.status, verdict.meta);
                     return reply(state, 63, "certificate declined");
+                }
                 const auto deliveryDecision = std::make_shared<std::atomic_bool>(false);
                 try
                 {

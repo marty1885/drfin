@@ -29,18 +29,24 @@ int main()
 
     bool first = false;
     handler({nullptr, "trusted@example.test", "example.test"},
-            [&first](auto decision) { first = decision; });
+            [&first](auto decision) { first = decision.accepted; });
     require(first);
 
     bool second = false;
     handler({nullptr, "new@example.test", "example.test"},
-            [&second](auto decision) { second = decision; });
+            [&second](auto decision) { second = decision.accepted; });
     require(second);
 
     bool third = true;
     handler({nullptr, "other@example.test", "example.test"},
-            [&third](auto decision) { third = decision; });
+            [&third](auto decision) { third = decision.accepted; });
     require(!third);
+
+    // A declined verdict is permanent unless the handler asks for a retry.
+    const drfin::TofuVerdict declined{false};
+    require(!declined.accepted && declined.status == 63);
+    const auto busy = drfin::TofuVerdict::temporaryFailure(44, "temporarily busy");
+    require(!busy.accepted && busy.status == 44 && busy.meta == "temporarily busy");
 
     int storageStatus = 0;
     std::string storageMeta;

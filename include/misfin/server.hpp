@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace drfin
 {
@@ -34,7 +35,26 @@ struct IncomingMessage
 using ServerIdentityProvider =
     std::function<std::shared_ptr<const Credentials>(std::string serverName)>;
 
-using TofuDecision = std::function<void(bool accept)>;
+// A bool accepts or declines the sender certificate; declined senders receive
+// a permanent 63. Conditions the sender should retry, such as local rate
+// limits, use temporaryFailure() with a 4x status instead.
+struct TofuVerdict
+{
+    TofuVerdict(bool accept) : accepted{accept} {}
+    static TofuVerdict temporaryFailure(int status, std::string meta)
+    {
+        TofuVerdict verdict{false};
+        verdict.status = status;
+        verdict.meta = std::move(meta);
+        return verdict;
+    }
+
+    bool accepted;
+    int status = 63;
+    std::string meta = "certificate declined";
+};
+
+using TofuDecision = std::function<void(TofuVerdict verdict)>;
 // The status and meta are validated before being sent. For every 20 response,
 // meta must be the recipient mailbox certificate fingerprint; the TLS server
 // certificate is not necessarily the recipient identity.

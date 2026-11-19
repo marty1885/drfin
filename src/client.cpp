@@ -180,6 +180,8 @@ class Operation : public std::enable_shared_from_this<Operation>
 
     void startCandidates(std::vector<trantor::InetAddress> addresses)
     {
+        if (finished_)
+            return;
         if (addresses.empty())
             return finish(std::unexpected("DNS lookup failed"));
 
@@ -205,7 +207,6 @@ class Operation : public std::enable_shared_from_this<Operation>
         candidateStates_.assign(candidates_.size(), CandidateState::Pending);
         clients_.resize(candidates_.size());
         candidateTimers_.resize(candidates_.size(), trantor::InvalidTimerId);
-        startCandidate(0);
         for (std::size_t index = 1; index < candidates_.size(); ++index)
         {
             candidateTimers_[index] = loop_.runAfter(
@@ -213,6 +214,8 @@ class Operation : public std::enable_shared_from_this<Operation>
                     if (const auto self = weak.lock()) self->startCandidate(index);
                 });
         }
+        // A synchronous failure can finish the operation and cancel every timer.
+        startCandidate(0);
     }
 
     void startCandidate(std::size_t index)

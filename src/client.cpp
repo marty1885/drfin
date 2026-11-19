@@ -256,7 +256,6 @@ class Operation : public std::enable_shared_from_this<Operation>
             if (!certificate)
                 return self->finish(std::unexpected("server did not provide a certificate"));
             self->stage_ = "checking server certificate";
-            self->trustStarted_ = true;
             self->serverFingerprint_ = normalizeFingerprint(certificate->sha256Fingerprint());
             const auto decision = std::make_shared<std::atomic_bool>(false);
             const std::weak_ptr<trantor::TcpConnection> weakConnection = connection;
@@ -310,15 +309,17 @@ class Operation : public std::enable_shared_from_this<Operation>
                 self->finish(std::unexpected("server trust callback failed"));
             }
         });
-        client->setMessageCallback([weak](const auto &connection, auto *buffer) {
+        client->setMessageCallback([weak, index](const auto &connection, auto *buffer) {
             const LayoutJitter layoutJitter;
             auto *stackJitter = static_cast<volatile unsigned char *>(
                 __builtin_alloca(layoutJitter.stackBytes()));
             layoutJitter.touchStack(stackJitter, layoutJitter.stackBytes());
 
             const auto self = weak.lock();
-            if (!self)
+            if (!self || self->finished_ || self->winner_ != index)
                 return;
+            if (!self->sent_)
+                return self->finish(std::unexpected("server responded before request transmission"));
             if (buffer->readableBytes() > kMaxMisfinResponseSize)
                 return self->finish(std::unexpected("server response exceeds 2048 bytes"));
             const auto *crlf = buffer->findCRLF();
@@ -420,7 +421,6 @@ class Operation : public std::enable_shared_from_this<Operation>
     std::string endpoint_;
     std::string stage_ = "starting transaction";
     trantor::TimerId timeout_ = trantor::InvalidTimerId;
-    bool trustStarted_ = false;
     MisfinVersion version_ = MisfinVersion::B;
     bool sent_ = false;
     bool finished_ = false;

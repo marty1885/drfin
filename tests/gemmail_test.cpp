@@ -55,6 +55,9 @@ int main()
     assert(!drfin::Gemmail::parseC("bee@hive.example Alice, Senior Engineer\n\n\n").has_value());
     assert(!drfin::Gemmail::parseC("bee@hive.example user@example\n\n\n").has_value());
     assert(!drfin::Gemmail::parseC("bee@hive.example\n\n2026-02-29T12:00:00Z\n").has_value());
+    assert(!drfin::Gemmail::parseC("\n\n2026-08-12T12:00:00X\n"));
+    assert(!drfin::Gemmail::parseC("\n\n2026-08-12T+1:00:00Z\n"));
+    assert(drfin::Gemmail::parseC("\n\n2024-02-29T23:59:60Z\n"));
     assert(!drfin::Gemmail::parseC("bee@hive.example\rbroken\n\n\n").has_value());
     assert(!drfin::Gemmail::parseC("\n\n\nunterminated").has_value());
     assert(!drfin::Gemmail::parseC(std::string(1024, 'a') + "\n\n\n").has_value());

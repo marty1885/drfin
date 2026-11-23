@@ -4,7 +4,6 @@
 #include <array>
 #include <algorithm>
 #include <cctype>
-#include <cstdio>
 
 namespace drfin
 {
@@ -68,13 +67,22 @@ std::optional<GemmailAddress> parseCAddress(std::string_view value, bool allowBl
 
 bool isIso8601Utc(std::string_view value)
 {
-    int year, month, day, hour, minute, second;
-    char trailing;
-    const std::string text{value};
-    if (text.size() != 20) return false;
-    if (std::sscanf(text.c_str(), "%4d-%2d-%2dT%2d:%2d:%2dZ%c",
-                    &year, &month, &day, &hour, &minute, &second, &trailing) != 6)
-        return false;
+    constexpr std::string_view format = "dddd-dd-ddTdd:dd:ddZ";
+    if (value.size() != format.size()) return false;
+    for (std::size_t i = 0; i < format.size(); ++i)
+    {
+        if (format[i] == 'd')
+        {
+            if (value[i] < '0' || value[i] > '9') return false;
+        }
+        else if (value[i] != format[i]) return false;
+    }
+    const auto pairAt = [value](std::size_t i) {
+        return 10 * (value[i] - '0') + (value[i + 1] - '0');
+    };
+    const int year = 100 * pairAt(0) + pairAt(2);
+    const int month = pairAt(5), day = pairAt(8);
+    const int hour = pairAt(11), minute = pairAt(14), second = pairAt(17);
     if (month < 1 || month > 12 || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
         second < 0 || second > 60)
         return false;

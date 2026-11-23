@@ -185,7 +185,7 @@ void reply(const std::shared_ptr<ConnectionState> &state,
             });
     }
     if (!isMisfinResponseStatus(status) || responseMeta.find_first_of("\r\n") != std::string::npos ||
-        invalidSuccessFingerprint)
+        !isValidUtf8(responseMeta) || invalidSuccessFingerprint)
     {
         LOG_ERROR << "Misfin server attempted an invalid response";
         status = 50;

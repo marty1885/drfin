@@ -38,7 +38,7 @@ std::expected<Response, std::string> parseResponse(const std::string &line,
     if (error != std::errc{} || end != line.data() + 2 || !isMisfinResponseStatus(status))
         return std::unexpected("server sent an invalid Misfin response");
     const auto meta = line.substr(3);
-    if (status == 20)
+    if (status / 10 == 2)
     {
         // Success returns the recipient mailbox certificate fingerprint, not
         // necessarily the TLS server certificate fingerprint. C additionally

@@ -26,6 +26,8 @@ namespace drfin
 {
 namespace
 {
+constexpr double kResponseCloseTimeout = 2.0;
+
 void validateIdentity(const Credentials &identity)
 {
     if (!trantor::Certificate::fromPem(identity.certificatePem))
@@ -80,12 +82,26 @@ struct ConnectionState
 {
     std::weak_ptr<trantor::TcpConnection> connection;
     std::shared_ptr<class ConnectionPermit> permit;
+    trantor::TimerId closeDeadline = trantor::InvalidTimerId;
     std::string serverName;
     bool processing = false;
     bool replied = false;
     std::optional<CHeader> cHeader;
     MisfinVersion version = MisfinVersion::B;
 };
+
+void setCloseDeadline(ConnectionState &state,
+                      const trantor::TcpConnectionPtr &connection,
+                      double timeout)
+{
+    auto *loop = connection->getLoop();
+    if (state.closeDeadline != trantor::InvalidTimerId)
+        loop->invalidateTimer(state.closeDeadline);
+    state.closeDeadline = loop->runAfter(timeout, [weak = state.connection] {
+        if (const auto connection = weak.lock())
+            connection->forceClose();
+    });
+}
 
 class ConnectionLimiter final
 {
@@ -156,12 +172,12 @@ void reply(const std::shared_ptr<ConnectionState> &state,
         return;
     std::string responseMeta = meta;
     bool invalidSuccessFingerprint = false;
-    if (status == 20 && state->version == MisfinVersion::B)
+    if (status / 10 == 2 && state->version == MisfinVersion::B)
     {
         invalidSuccessFingerprint = !isValidSha256Fingerprint(responseMeta);
         if (!invalidSuccessFingerprint) responseMeta = normalizeFingerprint(responseMeta);
     }
-    else if (status == 20)
+    else if (status / 10 == 2)
     {
         invalidSuccessFingerprint = responseMeta.size() != 64 ||
             std::ranges::any_of(responseMeta, [](unsigned char character) {
@@ -185,6 +201,8 @@ void reply(const std::shared_ptr<ConnectionState> &state,
     state->processing = false;
     if (const auto connection = state->connection.lock())
     {
+        connection->getRecvBuffer()->retrieveAll();
+        setCloseDeadline(*state, connection, kResponseCloseTimeout);
         connection->send(response);
         // Misfin is exactly one request and one response per TLS connection.
         // shutdown() flushes the queued response, then sends close_notify and
@@ -213,7 +231,6 @@ class Listener : public std::enable_shared_from_this<Listener>
     {
         server_ = std::make_unique<trantor::TcpServer>(
             &loop_, trantor::InetAddress(address, port), "misfin-server", true, true);
-        server_->kickoffIdleConnections(static_cast<size_t>(kMisfinTransactionTimeout));
 
         // Request, but do not TLS-validate, sender certificates. Misfin's
         // asynchronous TOFU handler decides trust after the handshake.
@@ -227,27 +244,43 @@ class Listener : public std::enable_shared_from_this<Listener>
             });
         policy->setPeerCertificateRequest(false)
             .setCertificateVerification(false);
-        server_->enableSSL(std::move(policy));
         const std::weak_ptr<Listener> weak = shared_from_this();
-        server_->setConnectionCallback([weak](const auto &connection) {
-            const auto self = weak.lock();
-            if (!self)
-                return;
+        // TcpServer's SSL mode reports connections only after the handshake.
+        // Admit the TCP socket first, then install TLS on the same event loop
+        // before it can dispatch any readable data.
+        server_->setConnectionCallback([limiter = connectionLimiter_,
+                                        policy = std::move(policy)](const auto &connection) {
             if (!connection->connected())
             {
                 if (const auto state = connection->template getContext<ConnectionState>())
+                {
+                    connection->getLoop()->invalidateTimer(state->closeDeadline);
+                    state->processing = false;
                     state->permit.reset();
+                }
                 return;
             }
-            if (!self->connectionLimiter_->tryAcquire())
+            if (!limiter->tryAcquire())
             {
                 connection->forceClose();
                 return;
             }
             auto state = std::make_shared<ConnectionState>();
             state->connection = connection;
-            state->permit = std::make_shared<ConnectionPermit>(self->connectionLimiter_);
-            connection->setContext(std::move(state));
+            state->permit = std::make_shared<ConnectionPermit>(limiter);
+            connection->setContext(state);
+            setCloseDeadline(*state, connection, kMisfinTransactionTimeout);
+            try
+            {
+                // The upgrade callback keeps handshake completion from
+                // invoking the TCP admission callback a second time.
+                connection->startEncryption(policy, true, [](const auto &) {});
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR << "Misfin server could not start TLS: " << error.what();
+                connection->forceClose();
+            }
         });
         server_->setRecvMessageCallback([weak](const auto &connection, auto *buffer) {
             if (const auto self = weak.lock())
@@ -292,15 +325,17 @@ class Listener : public std::enable_shared_from_this<Listener>
             __builtin_alloca(layoutJitter.stackBytes()));
         layoutJitter.touchStack(stackJitter, layoutJitter.stackBytes());
 
-        auto state = connection->getContext<ConnectionState>();
+        const auto state = connection->getContext<ConnectionState>();
         if (!state)
         {
-            state = std::make_shared<ConnectionState>();
-            state->connection = connection;
-            connection->setContext(state);
+            connection->forceClose();
+            return;
         }
         if (state->replied)
+        {
+            buffer->retrieveAll();
             return;
+        }
         // Misfin permits exactly one request per connection.  The request may
         // be awaiting asynchronous certificate or delivery work, but it has
         // already consumed this connection's sole request slot.

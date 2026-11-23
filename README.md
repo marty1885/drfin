@@ -38,8 +38,9 @@ server.listen(
 The trust callback receives the parsed recipient and TLS SNI name as well as
 the certificate. Rejecting it returns Misfin status 63. Once accepted, the
 delivery callback returns the exact Misfin status and meta, permitting policy
-and storage failures such as status 44. For a successful 2x response, Dr.Fin
-uses the server TLS certificate fingerprint as the response meta.
+and storage failures such as status 44. For a successful 2x response, the
+delivery callback supplies the recipient mailbox certificate fingerprint
+as the response meta.
 
 Client:
 

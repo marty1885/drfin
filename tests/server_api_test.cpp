@@ -1,4 +1,5 @@
 #include <misfin/server.hpp>
+#include "../src/request_phase.hpp"
 
 #include <cstdlib>
 #include <string>
@@ -15,6 +16,12 @@ void require(bool condition)
 
 int main()
 {
+    using namespace drfin::detail;
+    static_assert(onInput(RequestPhase::Receiving) == InputAction::Parse);
+    static_assert(onInput(RequestPhase::AwaitingTrust) == InputAction::Reject);
+    static_assert(onInput(RequestPhase::Delivering) == InputAction::Discard);
+    static_assert(onInput(RequestPhase::Done) == InputAction::Discard);
+
     // One remote certificate can have a different TOFU outcome for each local
     // recipient. This is the API property Northwire requires.
     const std::unordered_map<std::string, bool> policy{

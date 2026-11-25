@@ -3,6 +3,7 @@
 #include <misfin/url.hpp>
 #include <misfin/utils.hpp>
 #include "layout_jitter.hpp"
+#include "request_phase.hpp"
 
 #include <drogon/drogon.h>
 
@@ -78,14 +79,15 @@ std::optional<CHeader> parseCHeader(const std::string &line)
     return CHeader{recipient, contentSize};
 }
 
+using detail::RequestPhase;
+
 struct ConnectionState
 {
     std::weak_ptr<trantor::TcpConnection> connection;
     std::shared_ptr<class ConnectionPermit> permit;
     trantor::TimerId closeDeadline = trantor::InvalidTimerId;
     std::string serverName;
-    bool processing = false;
-    bool replied = false;
+    RequestPhase phase = RequestPhase::Receiving;
     std::optional<CHeader> cHeader;
     MisfinVersion version = MisfinVersion::B;
 };
@@ -168,7 +170,7 @@ void reply(const std::shared_ptr<ConnectionState> &state,
            int status,
            const std::string &meta)
 {
-    if (state->replied)
+    if (state->phase == RequestPhase::Done)
         return;
     std::string responseMeta = meta;
     bool invalidSuccessFingerprint = false;
@@ -197,8 +199,7 @@ void reply(const std::shared_ptr<ConnectionState> &state,
         LOG_WARN << "Misfin server response exceeds " << kMaxMisfinResponseSize << " bytes";
         response = "50 internal server error\r\n";
     }
-    state->replied = true;
-    state->processing = false;
+    state->phase = RequestPhase::Done;
     if (const auto connection = state->connection.lock())
     {
         connection->getRecvBuffer()->retrieveAll();
@@ -255,7 +256,7 @@ class Listener : public std::enable_shared_from_this<Listener>
                 if (const auto state = connection->template getContext<ConnectionState>())
                 {
                     connection->getLoop()->invalidateTimer(state->closeDeadline);
-                    state->processing = false;
+                    state->phase = RequestPhase::Done;
                     state->permit.reset();
                 }
                 return;
@@ -331,16 +332,16 @@ class Listener : public std::enable_shared_from_this<Listener>
             connection->forceClose();
             return;
         }
-        if (state->replied)
+        switch (detail::onInput(state->phase))
         {
-            buffer->retrieveAll();
-            return;
+            case detail::InputAction::Discard:
+                buffer->retrieveAll();
+                return;
+            case detail::InputAction::Reject:
+                return reply(state, 59, "multiple requests on one connection");
+            case detail::InputAction::Parse:
+                break;
         }
-        // Misfin permits exactly one request per connection.  The request may
-        // be awaiting asynchronous certificate or delivery work, but it has
-        // already consumed this connection's sole request slot.
-        if (state->processing)
-            return reply(state, 59, "multiple requests on one connection");
         std::optional<Request> request;
         if (state->cHeader)
         {
@@ -395,7 +396,7 @@ class Listener : public std::enable_shared_from_this<Listener>
                 return reply(state, 59, "invalid UTF-8 message");
         }
 
-        state->processing = true;
+        state->phase = RequestPhase::AwaitingTrust;
 
         const auto peer = connection->peerCertificate();
         if (!peer)
@@ -433,7 +434,7 @@ class Listener : public std::enable_shared_from_this<Listener>
                 // The connection may have been rejected for receiving more
                 // data while this asynchronous decision was outstanding.
                 // Do not start delivery after that rejection.
-                if (!state->processing)
+                if (state->phase != RequestPhase::AwaitingTrust)
                     return;
                 if (!verdict.accepted)
                 {
@@ -442,6 +443,7 @@ class Listener : public std::enable_shared_from_this<Listener>
                         return reply(state, verdict.status, verdict.meta);
                     return reply(state, 63, "certificate declined");
                 }
+                state->phase = RequestPhase::Delivering;
                 const auto deliveryDecision = std::make_shared<std::atomic_bool>(false);
                 try
                 {

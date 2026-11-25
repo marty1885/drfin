@@ -38,6 +38,8 @@ std::expected<Response, std::string> parseResponse(const std::string &line,
     if (error != std::errc{} || end != line.data() + 2 || !isMisfinResponseStatus(status))
         return std::unexpected("server sent an invalid Misfin response");
     const auto meta = line.substr(3);
+    if (meta.find_first_of("\r\n") != std::string::npos)
+        return std::unexpected("server sent a line break in response metadata");
     if (!isValidUtf8(meta))
         return std::unexpected("server sent invalid UTF-8 response metadata");
     if (status / 10 == 2)
@@ -226,7 +228,20 @@ class Operation : public std::enable_shared_from_this<Operation>
             return;
         const auto &address = candidates_[index];
         candidateStates_[index] = CandidateState::Connecting;
-        if (!connectionPolicy_(endpoint_, address.toIp()))
+        bool permitted;
+        try
+        {
+            permitted = connectionPolicy_(endpoint_, address.toIp());
+        }
+        catch (const std::exception &error)
+        {
+            return finish(std::unexpected(error.what()));
+        }
+        catch (...)
+        {
+            return finish(std::unexpected("destination policy callback failed"));
+        }
+        if (!permitted)
             return candidateFailed(index, "destination address is not permitted");
         stage_ = "connecting to recipient";
         // TcpClient::connect() uses shared_from_this() internally.
